@@ -120,16 +120,57 @@ class ReefBeatClient:
     def get_unread_notification_count(self, days: int = 60) -> int:
         return self._get(f"/notification/inapp/count-unread?days={days}")
 
+    # ── Auto-discovery ──────────────────────────────────────
+
+    def discover(self, aquarium_index=0) -> dict:
+        """Auto-discover aquarium UID and all device HWIDs.
+
+        Returns a dict with aquarium_uid and hwids for each device type.
+        """
+        aquariums = self.get_aquariums()
+        if not aquariums:
+            raise RuntimeError("No aquariums found on this account")
+        aquarium = aquariums[aquarium_index]
+        aquarium_uid = aquarium["uid"]
+        dashboard = self.get_dashboard(aquarium_uid)
+
+        def _first_hwid(key):
+            devices = dashboard.get(key, [])
+            return devices[0]["common"]["hwid"] if devices else None
+
+        def _all_hwids(key):
+            return [d["common"]["hwid"] for d in dashboard.get(key, [])]
+
+        return {
+            "aquarium_uid": aquarium_uid,
+            "aquarium_name": aquarium.get("name"),
+            "ato_hwid": _first_hwid("reef_ato"),
+            "pump_hwid": _first_hwid("reef_run"),
+            "light_hwids": _all_hwids("reef_lights"),
+            "wave_hwids": _all_hwids("reef_wave"),
+            "reefmat_hwid": _first_hwid("reef_mat"),
+        }
+
     # ── Snapshot: all KPIs in one call ──────────────────────
 
     def snapshot(
         self,
-        aquarium_uid: str,
-        ato_hwid: str,
-        pump_hwid: str,
+        aquarium_uid=None,
+        ato_hwid=None,
+        pump_hwid=None,
         light_hwids=None,
     ) -> dict:
-        """Fetch key tank KPIs for e-ink display."""
+        """Fetch key tank KPIs for e-ink display.
+
+        If device IDs are not provided, auto-discovers them.
+        """
+        if not aquarium_uid or not ato_hwid or not pump_hwid:
+            discovered = self.discover()
+            aquarium_uid = aquarium_uid or discovered["aquarium_uid"]
+            ato_hwid = ato_hwid or discovered["ato_hwid"]
+            pump_hwid = pump_hwid or discovered["pump_hwid"]
+            light_hwids = light_hwids or discovered["light_hwids"]
+
         ato = self.get_ato_dashboard(ato_hwid)
         pumps = self.get_pump_dashboard(pump_hwid)
         dashboard = self.get_dashboard(aquarium_uid)
@@ -193,6 +234,34 @@ class ReefBeatClient:
                 "reverse_intensity": active.get("rti"),
             })
 
+        # ReefMat / Roller from dashboard
+        roller = {}
+        reef_mats = dashboard.get("reef_mat", [])
+        if reef_mats:
+            mat = reef_mats[0]
+            spec = mat.get("specific", {})
+            material = spec.get("material", {})
+            # Total roll length from material name (e.g. "28 Meter")
+            total_m = None
+            mat_name = material.get("name", "")
+            parts = mat_name.split()
+            if parts and parts[0].replace(".", "").isdigit():
+                total_m = float(parts[0])
+            remaining_cm = spec.get("remaining_length", 0)
+            remaining_m = remaining_cm / 100 if remaining_cm else 0
+            used_pct = 0
+            if total_m and total_m > 0:
+                used_pct = round((1 - remaining_m / total_m) * 100, 1)
+            roller = {
+                "days_remaining": spec.get("days_till_end_of_roll"),
+                "roll_level": spec.get("roll_level"),
+                "remaining_m": round(remaining_m, 1),
+                "total_m": total_m,
+                "used_pct": used_pct,
+                "daily_avg_cm": round(spec.get("daily_average_usage", 0), 1),
+                "auto_advance": spec.get("auto_advance"),
+            }
+
         # Unread alerts
         try:
             unread = self.get_unread_notification_count()
@@ -220,6 +289,7 @@ class ReefBeatClient:
             },
             "waves": waves,
             "lights": lights,
+            "roller": roller,
             "unread_alerts": unread,
             "online": True,
         }
