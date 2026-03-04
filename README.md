@@ -9,12 +9,14 @@ A reverse-engineered API client for the [Red Sea ReefBeat](https://www.redseafis
 OpenReefBeat talks directly to the ReefBeat cloud API, pulling live data from all your connected devices:
 
 - **Water temperature** with 10-day historical sparkline
-- **Water level** and ATO fill stats (volume, fill count, auto-fill status)
-- **Leak detection** status
+- **Water level** with green/red status indicator and ATO fill stats (volume, fill count, auto-fill status)
+- **Leak detection** with green/red status indicator
 - **Light status** — intensity, color temp, white/blue/moon channels, LED temps, fan speed
 - **Pump status** — return and skimmer intensity with sensor status
-- **Wave pump status** — program, forward/reverse intensity (left + right)
-- **ReefMat roller** — remaining roll length, days until replacement, usage bar
+- **Skimmer cup warning** — red gauge + warning triangle when cup is full
+- **Wave pump status** — program name, forward/reverse intensity (left + right)
+- **ReefMat roller** — used/total in feet, today and average daily usage in inches, days until replacement, progress bar with color coding
+- **Interactive buttons** — toggle ATO, waste, salt fill, skimmer resume, and stop all directly from the display
 - **Notifications** — unread alert count
 
 All devices are **auto-discovered** from your ReefBeat account — no manual device ID configuration needed.
@@ -23,12 +25,12 @@ All devices are **auto-discovered** from your ReefBeat account — no manual dev
 
 The e-ink display renders an 800x480 dashboard optimized for the Inky Frame's 6-color Spectra palette (black, white, red, green, blue, yellow):
 
-- **Header** — tank name/location, current date and time, last update
-- **Left panel** — temperature with trend chart, water level, ATO stats, leak status, roller progress
-- **Right panel** — circular gauges for lights (intensity + moon), pumps (return + skimmer), waves (left + right)
-- **Footer** — system status (all operational / leak detected / water level warning)
+- **Header** — tank name, status indicator (blue = operational, red = alert), date and time via NTP
+- **Left panel** — large temperature readout, water level with status dot, ATO stats, leak status with status dot, roller progress bar with used/total in feet and daily usage in inches
+- **Right panel** — circular gauges for lights (intensity + moon), pumps (return + skimmer), waves (left + right) with wave program name. Skimmer gauge turns red with warning triangle when cup is full
+- **Button bar** — five interactive buttons (A–E) for ATO, waste, salt fill, skimmer resume, and stop all. Labels toggle on press
 
-An error screen with setup instructions is shown when the device can't connect.
+Refreshes every 5 minutes with live data from the ReefBeat cloud API. An error screen with setup instructions is shown when the device can't connect.
 
 ## Quick Start
 
@@ -96,30 +98,53 @@ The Inky Frame 7.3" is a standalone board with a Pico W running MicroPython. It 
 Edit `inky_frame/config.py` with your WiFi and ReefBeat credentials:
 
 ```python
-SSID = "YourWiFiNetwork"
-PASSWORD = "YourWiFiPassword"
+WIFI_NETWORKS = [
+    ("PrimaryNetwork", "password1"),
+    ("BackupNetwork", "password2"),
+]
 USERNAME = "your_email@example.com"
 REEFBEAT_PASSWORD = "your_password"
 ```
 
+Multiple WiFi networks are supported — the device tries each in order until one connects.
+
 ### 2. Deploy to the Inky Frame
 
-Copy two files to the device using [Thonny](https://thonny.org/) or USB mass storage:
+Copy two files to the device using [mpremote](https://docs.micropython.org/en/latest/reference/mpremote.html) (recommended) or [Thonny](https://thonny.org/):
 
-- `inky_frame/config.py`
-- `inky_frame/main.py`
+```bash
+pip install mpremote
+mpremote cp inky_frame/config.py :config.py
+mpremote cp inky_frame/main.py :main.py
+mpremote reset
+```
 
 ### 3. Power on
 
 The Inky Frame will:
 
-1. Connect to WiFi
-2. Log in to ReefBeat and auto-discover your devices
-3. Fetch all tank data
-4. Render the dashboard
-5. Deep sleep for 5 minutes, then repeat
+1. Connect to WiFi (tries each configured network up to 3 rounds)
+2. Sync clock via NTP
+3. Log in to ReefBeat and auto-discover your devices
+4. Fetch all tank data
+5. Render the dashboard
+6. Poll for button presses for 5 minutes, then refresh
 
-If WiFi or the API is unreachable, it displays an error screen with setup instructions and retries on the next wake cycle.
+### Buttons
+
+The five physical buttons on the Inky Frame are mapped to toggle actions:
+
+| Button | Default | Toggled |
+|--------|---------|---------|
+| A | ATO Off | ATO On |
+| B | Waste Off | Waste On |
+| C | Salt Fill Off | Salt Fill On |
+| D | Resume Skimmer (red) | Stop Skimmer |
+| E | Stop All | Resume All |
+
+Pressing a button toggles its label and triggers a display refresh. API integration for button actions is planned.
+
+If WiFi or the API is unreachable, it displays an error screen with setup instructions and retries on the next cycle.
 
 ## Project Structure
 
@@ -191,9 +216,14 @@ Other ReefBeat-connected devices likely work — the API patterns are consistent
 
 - [x] **ReefBeat API client** — OAuth2 auth, token caching, all device endpoints
 - [x] **Auto-discovery** — no manual device ID configuration needed
-- [x] **E-ink dashboard** — Pimoroni Inky Frame 7.3" with 6-color layout
+- [x] **E-ink dashboard** — Pimoroni Inky Frame 7.3" Spectra with 6-color circular gauge layout
+- [x] **Skimmer cup warning** — red gauge + warning triangle when skimmer cup is full
+- [x] **Roller detail** — used/total in feet, daily usage in inches, color-coded progress bar
+- [x] **Interactive buttons** — five toggle buttons for ATO, waste, salt fill, skimmer resume, stop all
+- [x] **Multi-WiFi support** — configure multiple networks with automatic failover
 - [x] **Temperature history** — sparkline chart from rolling 10-day history
 - [x] **History rotation** — auto-trim to 30 days to prevent storage bloat
+- [ ] **Button API integration** — wire physical buttons to ReefBeat API commands
 - [ ] **Alerts** — local notifications (LED, buzzer, or push) when values go out of range
 - [ ] **Multi-tank support** — handle multiple aquariums under one account
 - [ ] **Web dashboard** — lightweight local web UI as an alternative to e-ink

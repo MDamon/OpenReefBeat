@@ -1,6 +1,7 @@
 """OpenReefBeat — Inky Frame 7.3" Dashboard"""
 
 import gc
+import math
 import time
 import urequests
 import ntptime
@@ -15,16 +16,29 @@ WIDTH = 800
 HEIGHT = 480
 graphics = PicoGraphics(DISPLAY)
 
-WHITE = graphics.create_pen(255, 255, 255)
-BLACK = graphics.create_pen(0, 0, 0)
-BLUE = graphics.create_pen(0, 0, 255)
-GREEN = graphics.create_pen(0, 64, 0)
-RED = graphics.create_pen(255, 0, 0)
-YELLOW = graphics.create_pen(255, 255, 0)
+# Inky Frame native palette (mapped from device test)
+BLACK = 0
+WHITE = 1
+YELLOW = 2
+RED = 3
+BLUE = 5
+GREEN = 6
 
 HEADER_H = 44
 LEFT_W = 280
 PAD = 16
+
+# Button toggle states (True = active/on)
+btn_states = {
+    "A": False,  # ATO Off/On
+    "B": False,  # Waste Off/On
+    "C": False,  # Salt Fill Off/On
+    "D": False,  # Resume/Stop Skimmer
+    "E": False,  # Stop All / Resume All
+}
+GAUGE_R = 50
+GAUGE_THICK = 15
+GAUGE_STEPS = 72  # points per full circle — balances smoothness vs memory
 
 gc.collect()
 
@@ -133,6 +147,10 @@ def fetch_tank_data():
         "roller_pct": roller_pct,
         "roller_days": mat.get("days_till_end_of_roll"),
         "roller_level": mat.get("roll_level", ""),
+        "roller_today_cm": round(mat.get("today_usage", 0), 1),
+        "roller_avg_cm": round(mat.get("daily_average_usage", 0), 1),
+        "roller_used_cm": round(mat.get("total_usage", 0), 1),
+        "roller_remaining_cm": round(remaining_cm, 1),
     }
     del dashboard, lights, light, manual, waves, mats, mat, mat_material
     gc.collect()
@@ -157,6 +175,7 @@ def fetch_tank_data():
         result["return_pct"] = p1.get("intensity", 0)
         result["skimmer_pct"] = p2.get("intensity", 0)
         result["skimmer_sensor"] = p2.get("sensor_controlled", False)
+        result["skimmer_state"] = p2.get("state", "operational")
         del pumps, p1, p2
     gc.collect()
 
@@ -164,27 +183,63 @@ def fetch_tank_data():
 
 
 # ── Drawing helpers ─────────────────────────────────────────
-def draw_bar(x, y, w, h, pct, color):
-    graphics.set_pen(BLACK)
-    graphics.rectangle(x, y, w, h)
-    graphics.set_pen(WHITE)
-    graphics.rectangle(x + 1, y + 1, w - 2, h - 2)
-    fill_w = int((w - 2) * min(pct, 100) / 100)
-    if fill_w > 0:
-        graphics.set_pen(color)
-        graphics.rectangle(x + 1, y + 1, fill_w, h - 2)
+def _fill_ring(cx, cy, r_out, r_in, color, start_deg=0, end_deg=360):
+    """Fill a ring sector pixel-by-pixel. Solid, no gaps."""
+    graphics.set_pen(color)
+    r_out_sq = r_out * r_out
+    r_in_sq = r_in * r_in
+    # Convert to radians (0=top, clockwise)
+    if start_deg == 0 and end_deg == 360:
+        # Full ring — skip angle check for speed
+        for dy in range(-r_out, r_out + 1):
+            for dx in range(-r_out, r_out + 1):
+                d_sq = dx * dx + dy * dy
+                if r_in_sq <= d_sq <= r_out_sq:
+                    graphics.pixel(cx + dx, cy + dy)
+    else:
+        s_rad = (start_deg - 90) * math.pi / 180
+        e_rad = (end_deg - 90) * math.pi / 180
+        for dy in range(-r_out, r_out + 1):
+            for dx in range(-r_out, r_out + 1):
+                d_sq = dx * dx + dy * dy
+                if r_in_sq <= d_sq <= r_out_sq:
+                    a = math.atan2(dy, dx)
+                    # Normalize to match our start reference
+                    if a < s_rad:
+                        a += 2 * math.pi
+                    if s_rad <= a <= e_rad:
+                        graphics.pixel(cx + dx, cy + dy)
+    gc.collect()
 
 
-def draw_row(x, y, label, pct, color, label_w=130):
-    """Draw labeled bar filling available width."""
+def draw_gauge(cx, cy, pct, color, label):
+    """Draw a circular gauge with percentage and label."""
+    r_out = GAUGE_R
+    r_in = GAUGE_R - GAUGE_THICK
+
+    # Black outer border ring
+    _fill_ring(cx, cy, r_out, r_in, BLACK)
+    # White track (1px inset)
+    _fill_ring(cx, cy, r_out - 1, r_in + 1, WHITE)
+
+    # Filled arc
+    if pct > 0:
+        end_deg = int(360 * min(pct, 100) / 100)
+        _fill_ring(cx, cy, r_out - 1, r_in + 1, color, 0, end_deg)
+
+    # Center text: value%
     graphics.set_pen(BLACK)
     graphics.set_font("bitmap8")
-    graphics.text(label, x, y + 4, label_w, scale=2)
-    bar_x = x + label_w
-    bar_w = WIDTH - bar_x - PAD - 60
-    draw_bar(bar_x, y, bar_w, 24, pct, color)
-    graphics.set_pen(BLACK)
-    graphics.text("{}%".format(int(pct)), bar_x + bar_w + 8, y + 4, 60, scale=2)
+    val = "{}%".format(int(pct))
+    vw = graphics.measure_text(val, scale=3)
+    vx = max(0, cx - vw // 2)
+    graphics.text(val, vx, cy - 8, WIDTH, scale=3)
+
+    # Label below
+    if label:
+        lw = graphics.measure_text(label, scale=2)
+        lbx = max(0, cx - lw // 2)
+        graphics.text(label, lbx, cy + GAUGE_R + 10, WIDTH, scale=2)
     gc.collect()
 
 
@@ -207,12 +262,12 @@ def render_dashboard(data):
         status_text = "All systems operational"
         header_color = BLUE
 
-    # Header: tank name | status | date/time
-    HSCALE = 3
+    # Header: tank name | status | branding + date/time
     graphics.set_pen(header_color)
     graphics.rectangle(0, 0, WIDTH, HEADER_H)
     graphics.set_pen(WHITE)
     graphics.set_font("bitmap8")
+    HSCALE = 3
     tank = data.get("tank_name", "")
     graphics.text(tank, PAD, 10, WIDTH, scale=HSCALE)
     t = time.localtime()
@@ -223,9 +278,10 @@ def render_dashboard(data):
     graphics.text(status_text, WIDTH // 2 - sw // 2, 10, WIDTH, scale=HSCALE)
     gc.collect()
 
-    # Divider
+    # Divider (shortened — stop HEADER_H px from bottom for button bar)
+    BTN_H = HEADER_H
     graphics.set_pen(BLACK)
-    graphics.line(LEFT_W, HEADER_H, LEFT_W, HEIGHT)
+    graphics.line(LEFT_W, HEADER_H, LEFT_W, HEIGHT - BTN_H)
 
     # LEFT PANEL
     lx = PAD
@@ -236,22 +292,21 @@ def render_dashboard(data):
     graphics.set_pen(BLACK)
     graphics.set_font("bitmap8")
     if temp is not None:
-        graphics.text("{}F".format(temp), lx, y, LEFT_W - PAD * 2, scale=6)
+        graphics.text("{}F".format(temp), lx, y, WIDTH, scale=6)
     else:
         graphics.set_pen(RED)
-        graphics.text("--.-F", lx, y, LEFT_W - PAD * 2, scale=6)
+        graphics.text("--.-F", lx, y, WIDTH, scale=6)
     gc.collect()
 
-    # Water level
+    # Water level with status indicator
     y += 64
     level = data.get("level", "?")
-    graphics.set_pen(BLACK)
+    level_ok = level == "desired"
+    graphics.set_pen(GREEN if level_ok else RED)
+    graphics.circle(lx + 6, y + 10, 6)
+    graphics.set_pen(BLACK if level_ok else RED)
     graphics.set_font("bitmap8")
-    if level == "desired":
-        graphics.text("Level: {}".format(level), lx, y + 2, LEFT_W - PAD * 2, scale=2)
-    else:
-        graphics.set_pen(RED)
-        graphics.text("[!!] Level: {}".format(level), lx, y + 2, LEFT_W - PAD * 2, scale=2)
+    graphics.text("Level: {}".format(level), lx + 18, y + 2, WIDTH, scale=2)
 
     y += 30
     graphics.set_pen(BLACK)
@@ -261,26 +316,25 @@ def render_dashboard(data):
     y += 10
     graphics.set_pen(BLUE)
     graphics.set_font("bitmap8")
-    graphics.text("ATO", lx, y, LEFT_W - PAD * 2, scale=3)
+    graphics.text("ATO", lx, y, WIDTH, scale=3)
 
     y += 28
     graphics.set_pen(BLACK)
     vol_gal = round(data.get("ato_vol_ml", 0) / 3785.41, 2)
-    graphics.text("{} gal today".format(vol_gal), lx, y, scale=2)
+    graphics.text("{} gal today".format(vol_gal), lx, y, WIDTH, scale=2)
 
     y += 22
     fills = data.get("ato_fills", 0)
     auto = "ON" if data.get("auto_fill") else "OFF"
-    graphics.text("{} fills / Auto {}".format(fills, auto), lx, y, scale=2)
+    graphics.text("{} fills / Auto {}".format(fills, auto), lx, y, WIDTH, scale=2)
 
     y += 22
     leak = data.get("leak", "?")
-    if leak == "dry":
-        graphics.set_pen(BLACK)
-        graphics.text("Leak: {}".format(leak), lx, y, LEFT_W - PAD * 2, scale=2)
-    else:
-        graphics.set_pen(RED)
-        graphics.text("[!!] Leak: {}".format(leak), lx, y, LEFT_W - PAD * 2, scale=2)
+    leak_ok = leak == "dry"
+    graphics.set_pen(GREEN if leak_ok else RED)
+    graphics.circle(lx + 6, y + 8, 6)
+    graphics.set_pen(BLACK if leak_ok else RED)
+    graphics.text("Leak: {}".format(leak), lx + 18, y, WIDTH, scale=2)
     gc.collect()
 
     y += 30
@@ -291,7 +345,17 @@ def render_dashboard(data):
     y += 10
     graphics.set_pen(BLUE)
     graphics.set_font("bitmap8")
-    graphics.text("Roller", lx, y, LEFT_W - PAD * 2, scale=3)
+    # Roller header with used/total in feet
+    used_cm = data.get("roller_used_cm", 0)
+    rem_cm = data.get("roller_remaining_cm", 0)
+    total_cm = used_cm + rem_cm
+    used_ft = round(used_cm / 30.48, 1)
+    total_ft = round(total_cm / 30.48, 1)
+    graphics.text("Roller", lx, y, WIDTH, scale=3)
+    ft_text = "{}ft/{}ft".format(used_ft, total_ft)
+    fw = graphics.measure_text(ft_text, scale=2)
+    graphics.set_pen(BLACK)
+    graphics.text(ft_text, LEFT_W - PAD - fw, y + 6, WIDTH, scale=2)
 
     y += 28
     graphics.set_pen(BLACK)
@@ -300,75 +364,127 @@ def render_dashboard(data):
     roller_days = data.get("roller_days")
     roller_level = data.get("roller_level", "")
     bar_color = RED if roller_level == "running_low" else BLUE
-    print("RENDER roller: pct={} days={} level={}".format(roller_pct, roller_days, roller_level))
     if roller_pct > 0.1:
         bar_w = LEFT_W - PAD * 2
-        # Draw bar explicitly
         graphics.set_pen(BLACK)
         graphics.rectangle(lx, y, bar_w, 20)
         graphics.set_pen(WHITE)
         graphics.rectangle(lx + 1, y + 1, bar_w - 2, 18)
         fill_w = int((bar_w - 2) * roller_pct / 100)
-        print("RENDER bar: fill_w={} bar_w={} color={}".format(fill_w, bar_w, bar_color))
         if fill_w > 0:
             graphics.set_pen(bar_color)
             graphics.rectangle(lx + 1, y + 1, fill_w, 18)
         y += 26
+        # Today and average usage in inches
+        today_in = round(data.get("roller_today_cm", 0) / 2.54, 1)
+        avg_in = round(data.get("roller_avg_cm", 0) / 2.54, 1)
         graphics.set_pen(BLACK)
-        graphics.text("{}% used".format(int(roller_pct)), lx, y, LEFT_W, scale=2)
+        graphics.text("Today: {}in / Avg: {}in".format(today_in, avg_in), lx, y, WIDTH, scale=2)
         if roller_days is not None:
             y += 18
             graphics.set_pen(RED if roller_days <= 5 else BLACK)
-            graphics.text("{} days remaining".format(roller_days), lx, y, LEFT_W, scale=2)
+            graphics.text("{} days remaining".format(roller_days), lx, y, WIDTH, scale=2)
     else:
-        print("RENDER roller: showing No data")
-        graphics.text("No data", lx, y, LEFT_W, scale=2)
+        graphics.text("No data", lx, y, WIDTH, scale=2)
+
+    # Branding below roller
+    y += 24
+    graphics.set_pen(BLACK)
+    graphics.line(lx, y, LEFT_W - PAD, y)
+    y += 6
+    graphics.text("OpenReefBeat", lx, y, WIDTH, scale=1)
     gc.collect()
 
-    # RIGHT PANEL — fill the space
-    rx = LEFT_W + PAD
-    rw = WIDTH - LEFT_W - PAD * 2
-    y = HEADER_H + 14
+    # RIGHT PANEL — gauge layout (3 columns x 2 rows)
+    col1_cx = LEFT_W + (WIDTH - LEFT_W) // 6          # Lights
+    col2_cx = LEFT_W + (WIDTH - LEFT_W) // 2          # Pumps
+    col3_cx = LEFT_W + 5 * (WIDTH - LEFT_W) // 6      # Waves
+    top_y = HEADER_H + 14
+    row1_cy = top_y + 50 + GAUGE_R + 10
+    row2_cy = row1_cy + GAUGE_R * 2 + 70
 
-    # Lights
+    # Column headers
     graphics.set_pen(BLUE)
     graphics.set_font("bitmap8")
-    graphics.text("Lights", rx, y, rw, scale=3)
-    y += 32
-    draw_row(rx, y, "Intensity", data.get("light_pct", 0), BLUE)
-    y += 34
-    draw_row(rx, y, "Moon", data.get("moon_pct", 0), BLUE)
-    y += 46
+    for cx, label in [(col1_cx, "Lights"), (col2_cx, "Pumps"), (col3_cx, "Waves")]:
+        hw = graphics.measure_text(label, scale=3)
+        graphics.text(label, max(0, cx - hw // 2), top_y, WIDTH, scale=3)
 
-    # Pumps
-    graphics.set_pen(BLUE)
-    graphics.text("Pumps", rx, y, rw, scale=3)
-    y += 32
-    draw_row(rx, y, "Return", data.get("return_pct", 0), BLUE)
-    y += 34
-    draw_row(rx, y, "Skimmer", data.get("skimmer_pct", 0), BLUE)
-    y += 46
-
-    # Waves
-    graphics.set_pen(BLUE)
-    graphics.set_font("bitmap8")
-    graphics.text("Waves", rx, y, rw, scale=3)
+    # Wave program under Waves header
     prog = data.get("wave_program", "")
     if prog:
         graphics.set_pen(BLACK)
-        graphics.text(prog, rx + 140, y + 6, rw, scale=2)
-    y += 32
-    draw_row(rx, y, "Left", data.get("wave_l_pct", 0), BLUE)
-    y += 34
-    draw_row(rx, y, "Right", data.get("wave_r_pct", 0), BLUE)
+        pw = graphics.measure_text(prog, scale=2)
+        graphics.text(prog, max(0, col3_cx - pw // 2), top_y + 28, WIDTH, scale=2)
     gc.collect()
 
-    # Branding
-    graphics.set_pen(BLACK)
-    graphics.set_font("bitmap8")
-    bw = graphics.measure_text("OpenReefBeat", scale=1)
-    graphics.text("OpenReefBeat", WIDTH - PAD - bw, HEIGHT - 16, WIDTH, scale=1)
+    # Top row: Intensity, Return, Left wave
+    kelvin = data.get("light_kelvin", 0)
+    k_label = "{}K".format(kelvin // 1000) if kelvin else ""
+    draw_gauge(col1_cx, row1_cy, data.get("light_pct", 0), BLUE, k_label)
+    draw_gauge(col2_cx, row1_cy, data.get("return_pct", 0), BLUE, "Return")
+    draw_gauge(col3_cx, row1_cy, data.get("wave_l_pct", 0), BLUE, "Left")
 
+    # Bottom row: Moon, Skimmer, Right wave
+    draw_gauge(col1_cx, row2_cy, data.get("moon_pct", 0), BLUE, "Moon")
+    skimmer_full = data.get("skimmer_state") == "full-cup"
+    skimmer_color = RED if skimmer_full else BLUE
+    draw_gauge(col2_cx, row2_cy, data.get("skimmer_pct", 0), skimmer_color, "Skimmer")
+    if skimmer_full:
+        # Warning triangle + text below skimmer gauge
+        ty = row2_cy + GAUGE_R + 32
+        graphics.set_pen(RED)
+        # Triangle (pointing up) - narrow at top, wide at bottom
+        tcx = col2_cx - 30
+        for row in range(12):
+            half = row // 2
+            x0 = tcx + 6 - half
+            x1 = tcx + 6 + half
+            graphics.line(x0, ty + row, x1, ty + row)
+        # Exclamation mark in triangle
+        graphics.set_pen(WHITE)
+        graphics.line(tcx + 6, ty + 3, tcx + 6, ty + 7)
+        graphics.pixel(tcx + 6, ty + 9)
+        # "FULL" text
+        graphics.set_pen(RED)
+        graphics.set_font("bitmap8")
+        graphics.text("FULL", tcx + 16, ty, WIDTH, scale=2)
+    draw_gauge(col3_cx, row2_cy, data.get("wave_r_pct", 0), BLUE, "Right")
+
+    # ── Button bar at bottom ──
+    btn_top = HEIGHT - BTN_H
+    graphics.set_pen(BLACK)
+    graphics.line(0, btn_top, WIDTH, btn_top)
+    btn_w = WIDTH // 5
+    graphics.set_font("bitmap8")
+    # Button labels: (key, line1_off, line2_off, line1_on, line2_on, on_is_red)
+    btn_defs = [
+        ("A", "ATO", "Off", "ATO", "On", False),
+        ("B", "Waste", "Off", "Waste", "On", False),
+        ("C", "Salt Fill", "Off", "Salt Fill", "On", False),
+        ("D", "Resume", "Skimmer", "Stop", "Skimmer", True),
+        ("E", "Stop", "All", "Resume", "All", False),
+    ]
+    for i, (key, l1_off, l2_off, l1_on, l2_on, is_red) in enumerate(btn_defs):
+        bx = i * btn_w
+        if i > 0:
+            graphics.set_pen(BLACK)
+            graphics.line(bx, btn_top, bx, HEIGHT)
+        cx = bx + btn_w // 2
+        on = btn_states[key]
+        t1 = l1_on if on else l1_off
+        t2 = l2_on if on else l2_off
+        # D button is red when showing "Resume" (off state = needs resume)
+        if is_red and not on:
+            graphics.set_pen(RED)
+        else:
+            graphics.set_pen(BLACK)
+        w1 = graphics.measure_text(t1, scale=2)
+        w2 = graphics.measure_text(t2, scale=2)
+        graphics.text(t1, cx - w1 // 2, btn_top + 6, WIDTH, scale=2)
+        graphics.text(t2, cx - w2 // 2, btn_top + 24, WIDTH, scale=2)
+
+    gc.collect()
 
 
 def render_error(title, detail=""):
@@ -399,34 +515,55 @@ gc.collect()
 import network
 wlan = network.WLAN(network.STA_IF)
 
-for wifi_attempt in range(3):
-    print("WiFi attempt {}...".format(wifi_attempt + 1))
-    wlan.active(False)
-    time.sleep(1)
-    wlan.active(True)
-    wlan.config(pm=0xa11140)
-    wlan.connect(SSID, PASSWORD)
-    for _ in range(60):
-        if wlan.isconnected():
-            break
+wlan.active(False)
+time.sleep(2)
+wlan.active(True)
+time.sleep(1)
+wlan.config(pm=0xa11140)
+
+for attempt in range(3):
+    print("WiFi round {}...".format(attempt + 1))
+    for ssid, pwd in WIFI_NETWORKS:
+        print("  Trying '{}'...".format(ssid))
+        wlan.disconnect()
         time.sleep(1)
+        wlan.connect(ssid, pwd)
+        for _ in range(30):
+            status = wlan.status()
+            if status == 3:
+                break
+            time.sleep(1)
+        if wlan.isconnected():
+            print("  Connected to '{}'".format(ssid))
+            break
+        print("  '{}' failed (status={})".format(ssid, status))
     if wlan.isconnected():
         break
-    print("WiFi attempt {} failed, retrying...".format(wifi_attempt + 1))
+    print("Round {} failed, retrying...".format(attempt + 1))
+    wlan.active(False)
+    time.sleep(3)
+    wlan.active(True)
+    time.sleep(2)
+    wlan.config(pm=0xa11140)
 
 if not wlan.isconnected():
     print("WiFi failed!")
-    render_error("WiFi Failed", SSID)
+    render_error("WiFi Failed", "No networks found")
     graphics.update()
     ih.sleep(REFRESH_MINUTES)
 else:
     print("WiFi connected")
 
-    # Sync clock via NTP
-    try:
-        ntptime.settime()
-        print("NTP time synced")
-    except Exception:
+    # Sync clock via NTP (retry up to 3 times)
+    for _ntp in range(3):
+        try:
+            ntptime.settime()
+            print("NTP time synced")
+            break
+        except Exception:
+            print("NTP attempt {} failed".format(_ntp + 1))
+            time.sleep(2)
+    else:
         print("NTP sync failed (clock may be wrong)")
     gc.collect()
 
@@ -445,10 +582,42 @@ else:
         print("Rendering...")
         gc.collect()
         render_dashboard(data)
-        del data
         gc.collect()
 
         print("Updating display...")
         graphics.update()
-        print("Done! Sleeping {} min.".format(REFRESH_MINUTES))
-        ih.sleep(REFRESH_MINUTES)
+        print("Done! Polling buttons for {} min...".format(REFRESH_MINUTES))
+
+        # Poll buttons until refresh time
+        import inky_frame
+        buttons = [
+            ("A", inky_frame.button_a),
+            ("B", inky_frame.button_b),
+            ("C", inky_frame.button_c),
+            ("D", inky_frame.button_d),
+            ("E", inky_frame.button_e),
+        ]
+        deadline = time.time() + REFRESH_MINUTES * 60
+        while time.time() < deadline:
+            pressed = False
+            for key, btn in buttons:
+                if btn.read():
+                    btn_states[key] = not btn_states[key]
+                    print("Button {} pressed -> {}".format(key, btn_states[key]))
+                    pressed = True
+            if pressed:
+                # Re-render with updated button states
+                gc.collect()
+                render_dashboard(data)
+                gc.collect()
+                graphics.update()
+                print("Display updated after button press")
+                time.sleep(1)  # debounce
+            else:
+                time.sleep(0.2)
+
+        del data
+        gc.collect()
+        # Reboot for fresh data cycle
+        import machine
+        machine.reset()

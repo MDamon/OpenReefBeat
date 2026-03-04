@@ -33,19 +33,19 @@ LIGHT_GRAY = (200, 200, 200)
 
 # Layout
 HEADER_H = 44
-LEFT_W = 252
+LEFT_W = 280
 PAD = 16
 GAUGE_R = 50
-GAUGE_THICK = 12
-# Right panel columns — Lights gets its own section, Pumps + Waves share the rest
-LIGHTS_CX = 345
-PUMPS_CX = 510
-WAVES_CX = 680
-# Vertical dividers in right panel
-LIGHTS_DIV_X = 428
-PUMPS_DIV_X = 595
-TOP_GAUGE_Y = 155
-BOT_GAUGE_Y = 330
+GAUGE_THICK = 15
+BTN_H = 44
+# Right panel columns — 3 equal sections for Lights, Pumps, Waves
+RIGHT_W = WIDTH - LEFT_W
+COL1_CX = LEFT_W + RIGHT_W // 6       # Lights
+COL2_CX = LEFT_W + RIGHT_W // 2       # Pumps
+COL3_CX = LEFT_W + 5 * RIGHT_W // 6   # Waves
+TOP_Y = HEADER_H + 14
+TOP_GAUGE_Y = TOP_Y + 50 + GAUGE_R + 10
+BOT_GAUGE_Y = TOP_GAUGE_Y + GAUGE_R * 2 + 70
 
 DATA_DIR = Path(__file__).parent / "data"
 HISTORY_FILE = DATA_DIR / "history.jsonl"
@@ -240,7 +240,7 @@ def render_dashboard(data, temp_history=None, location=""):
         draw.text((WIDTH - PAD - rbw, 24), right_bot, fill=WHITE, font=FONT_SMALL)
 
     # ── Left/Right divider ────────────────────────────
-    draw.line([LEFT_W, HEADER_H, LEFT_W, HEIGHT], fill=BLACK, width=1)
+    draw.line([LEFT_W, HEADER_H, LEFT_W, HEIGHT - BTN_H], fill=BLACK, width=1)
 
     # ── LEFT PANEL ────────────────────────────────────
     lx = PAD
@@ -308,26 +308,46 @@ def render_dashboard(data, temp_history=None, location=""):
     days_left = roller.get("days_remaining", "?")
     remaining_m = roller.get("remaining_m", 0)
     total_m = roller.get("total_m", 0)
-    draw_progress_bar(draw, lx, y, LEFT_W - PAD * 2, 14, used_pct, YELLOW)
+    used_ft = round(float(total_m - remaining_m) * 3.281, 1) if total_m else 0
+    total_ft = round(float(total_m) * 3.281, 1) if total_m else 0
+    roller_level = roller.get("level", "")
+    bar_color = RED if roller_level == "running_low" else BLUE
+
+    # Used/total in feet
+    ft_text = f"{used_ft}ft / {total_ft}ft"
+    ftw = _tw(draw, ft_text, FONT_LABEL)
+    draw.text((LEFT_W - PAD - ftw, y - 20), ft_text, fill=BLACK, font=FONT_LABEL)
+
+    draw_progress_bar(draw, lx, y, LEFT_W - PAD * 2, 14, used_pct, bar_color)
     y += 20
-    draw.text((lx, y), f"{remaining_m} / {total_m} m", fill=BLACK, font=FONT_LABEL)
+    # Today and average usage in inches
+    today_in = round(roller.get("today_usage_cm", 0) / 2.54, 1)
+    avg_in = round(roller.get("daily_avg_cm", 0) / 2.54, 1)
+    draw.text((lx, y), f"Today: {today_in}in / Avg: {avg_in}in", fill=BLACK, font=FONT_LABEL)
     y += 16
-    days_color = RED if isinstance(days_left, int) and days_left <= 3 else BLACK
+    days_color = RED if isinstance(days_left, int) and days_left <= 5 else BLACK
     draw.text((lx, y), f"{days_left} days remaining", fill=days_color, font=FONT_LABEL)
+
+    # Branding
+    y += 20
+    draw.line([lx, y, LEFT_W - PAD, y], fill=LIGHT_GRAY, width=1)
+    y += 6
+    draw.text((lx, y), "OpenReefBeat", fill=BLACK, font=FONT_SMALL)
 
     # ── RIGHT PANEL ───────────────────────────────────
 
     # Section headers
-    hy = HEADER_H + 10
-    for cx, label in [(LIGHTS_CX, "Lights"), (PUMPS_CX, "Pumps"), (WAVES_CX, "Waves")]:
+    hy = TOP_Y
+    for cx, label in [(COL1_CX, "Lights"), (COL2_CX, "Pumps"), (COL3_CX, "Waves")]:
         tw = _tw(draw, label, FONT_HEADING)
         draw.text((cx - tw / 2, hy), label, fill=BLUE, font=FONT_HEADING)
 
-    # Vertical dividers between sections
-    div_top = HEADER_H + 6
-    div_bot = HEIGHT - 42
-    draw.line([LIGHTS_DIV_X, div_top, LIGHTS_DIV_X, div_bot], fill=LIGHT_GRAY, width=1)
-    draw.line([PUMPS_DIV_X, div_top, PUMPS_DIV_X, div_bot], fill=LIGHT_GRAY, width=1)
+    # Wave program under Waves header
+    waves = data.get("waves", [])
+    prog = waves[0].get("program", "") if waves else ""
+    if prog:
+        pw = _tw(draw, prog, FONT_SMALL)
+        draw.text((COL3_CX - pw / 2, hy + 22), prog, fill=BLACK, font=FONT_SMALL)
 
     # ── Gauges — Top row ──────────────────────────────
     lights = data.get("lights", [{}])
@@ -335,44 +355,52 @@ def render_dashboard(data, temp_history=None, location=""):
     kelvin = light.get("kelvin", 0)
     kelvin_str = f"{kelvin // 1000}K" if kelvin else "N/A"
 
-    draw_gauge(draw, LIGHTS_CX, TOP_GAUGE_Y, light.get("intensity_pct", 0), BLUE, kelvin_str)
-    draw_gauge(draw, PUMPS_CX, TOP_GAUGE_Y, data.get("return_pump", {}).get("intensity", 0), BLUE, "Return")
+    draw_gauge(draw, COL1_CX, TOP_GAUGE_Y, light.get("intensity_pct", 0), BLUE, kelvin_str)
+    draw_gauge(draw, COL2_CX, TOP_GAUGE_Y, data.get("return_pump", {}).get("intensity", 0), BLUE, "Return")
 
-    waves = data.get("waves", [])
     wave_l_pct = waves[1].get("forward_intensity", 0) if len(waves) > 1 else 0
     wave_r_pct = waves[0].get("forward_intensity", 0) if waves else 0
-    draw_gauge(draw, WAVES_CX, TOP_GAUGE_Y, wave_l_pct, BLUE, "Left")
+    draw_gauge(draw, COL3_CX, TOP_GAUGE_Y, wave_l_pct, BLUE, "Left")
 
     # ── Gauges — Bottom row ───────────────────────────
-    draw_gauge(draw, LIGHTS_CX, BOT_GAUGE_Y, light.get("moon_pct", 0), BLUE, "Moon")
-    draw_gauge(draw, PUMPS_CX, BOT_GAUGE_Y, data.get("skimmer", {}).get("intensity", 0), BLUE, "Skimmer")
-    draw_gauge(draw, WAVES_CX, BOT_GAUGE_Y, wave_r_pct, BLUE, "Right")
+    draw_gauge(draw, COL1_CX, BOT_GAUGE_Y, light.get("moon_pct", 0), BLUE, "Moon")
 
-    # Skimmer sensor dot
-    stxt = "Sensor"
-    sw = _tw(draw, stxt, FONT_SMALL)
-    sx = PUMPS_CX - sw / 2
-    sy = BOT_GAUGE_Y + GAUGE_R + 42
-    draw_dot(draw, int(sx) - 8, int(sy) + 5, GREEN, 3)
-    draw.text((int(sx), int(sy)), stxt, fill=BLACK, font=FONT_SMALL)
+    # Skimmer — red if cup full
+    skimmer = data.get("skimmer", {})
+    skimmer_full = skimmer.get("state") == "full-cup"
+    skimmer_color = RED if skimmer_full else BLUE
+    draw_gauge(draw, COL2_CX, BOT_GAUGE_Y, skimmer.get("intensity", 0), skimmer_color, "Skimmer")
+    if skimmer_full:
+        # Warning triangle + FULL text
+        ty = BOT_GAUGE_Y + GAUGE_R + 32
+        tcx = COL2_CX - 30
+        tri = [(tcx + 6, ty), (tcx, ty + 12), (tcx + 12, ty + 12)]
+        draw.polygon(tri, fill=RED)
+        draw.text((tcx - 2, ty + 1), "!", fill=WHITE, font=_font(10, bold=True))
+        draw.text((tcx + 16, ty), "FULL", fill=RED, font=FONT_LABEL)
 
-    # Wave program
-    prog = waves[0].get("program", "") if waves else ""
-    if prog:
-        pw = _tw(draw, prog, FONT_SMALL)
-        draw.text((WAVES_CX - pw / 2, BOT_GAUGE_Y + GAUGE_R + 42), prog, fill=BLACK, font=FONT_SMALL)
+    draw_gauge(draw, COL3_CX, BOT_GAUGE_Y, wave_r_pct, BLUE, "Right")
 
-    # ── Footer ────────────────────────────────────────
-    draw.line([LEFT_W + PAD, HEIGHT - 36, WIDTH - PAD, HEIGHT - 36], fill=LIGHT_GRAY, width=1)
-    leak = data.get("leak_status", "dry")
-    level = data.get("water_level", "desired")
-    if leak != "dry":
-        status, color = "LEAK DETECTED", RED
-    elif level != "desired":
-        status, color = f"Water level: {level}", RED
-    else:
-        status, color = "All systems operational", BLACK
-    draw.text((LEFT_W + PAD + 4, HEIGHT - 30), status, fill=color, font=FONT_STATUS)
+    # ── Button bar at bottom ──────────────────────────
+    btn_top = HEIGHT - BTN_H
+    draw.line([0, btn_top, WIDTH, btn_top], fill=BLACK, width=1)
+    btn_w = WIDTH // 5
+    btn_labels = [
+        ("ATO\nOff", BLACK),
+        ("Waste\nOff", BLACK),
+        ("Salt Fill\nOff", BLACK),
+        ("Resume\nSkimmer", RED),
+        ("Stop\nAll", BLACK),
+    ]
+    for i, (lbl, color) in enumerate(btn_labels):
+        bx = i * btn_w
+        if i > 0:
+            draw.line([bx, btn_top, bx, HEIGHT], fill=BLACK, width=1)
+        cx = bx + btn_w // 2
+        lines = lbl.split("\n")
+        for j, line in enumerate(lines):
+            lw = _tw(draw, line, FONT_LABEL)
+            draw.text((cx - lw / 2, btn_top + 6 + j * 16), line, fill=color, font=FONT_LABEL)
 
     return img
 
