@@ -265,13 +265,7 @@ def render_dashboard(data, temp_history=None, location=""):
     else:
         draw.text((lx, y), "--.-", fill=RED, font=FONT_TEMP)
 
-    # Sparkline — temperature history
-    y += 58
-    if temp_history and len(temp_history) >= 2:
-        draw_sparkline(draw, lx, y, LEFT_W - PAD * 2 - 40, 30, temp_history, BLUE)
-        y += 36
-    else:
-        y += 4
+    y += 62
 
     # Level
     level = data.get("water_level", "?")

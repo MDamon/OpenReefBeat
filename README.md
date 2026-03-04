@@ -8,7 +8,7 @@ A reverse-engineered API client for the [Red Sea ReefBeat](https://www.redseafis
 
 OpenReefBeat talks directly to the ReefBeat cloud API, pulling live data from all your connected devices:
 
-- **Water temperature** with 10-day historical sparkline
+- **Water temperature** — large readout in Fahrenheit
 - **Water level** with green/red status indicator and ATO fill stats (volume, fill count, auto-fill status)
 - **Leak detection** with green/red status indicator
 - **Light status** — intensity, color temp, white/blue/moon channels, LED temps, fan speed
@@ -221,7 +221,6 @@ Other ReefBeat-connected devices likely work — the API patterns are consistent
 - [x] **Roller detail** — used/total in feet, daily usage in inches, color-coded progress bar
 - [x] **Interactive buttons** — five toggle buttons for ATO, waste, salt fill, skimmer resume, stop all
 - [x] **Multi-WiFi support** — configure multiple networks with automatic failover
-- [x] **Temperature history** — sparkline chart from rolling 10-day history
 - [x] **History rotation** — auto-trim to 30 days to prevent storage bloat
 - [ ] **Button API integration** — wire physical buttons to ReefBeat API commands
 - [ ] **Alerts** — local notifications (LED, buzzer, or push) when values go out of range
