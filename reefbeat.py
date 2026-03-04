@@ -164,12 +164,14 @@ class ReefBeatClient:
 
         If device IDs are not provided, auto-discovers them.
         """
+        tank_name = ""
         if not aquarium_uid or not ato_hwid or not pump_hwid:
             discovered = self.discover()
             aquarium_uid = aquarium_uid or discovered["aquarium_uid"]
             ato_hwid = ato_hwid or discovered["ato_hwid"]
             pump_hwid = pump_hwid or discovered["pump_hwid"]
             light_hwids = light_hwids or discovered["light_hwids"]
+            tank_name = discovered.get("aquarium_name", "")
 
         ato = self.get_ato_dashboard(ato_hwid)
         pumps = self.get_pump_dashboard(pump_hwid)
@@ -258,6 +260,7 @@ class ReefBeatClient:
                 "remaining_m": round(remaining_m, 1),
                 "total_m": total_m,
                 "used_pct": used_pct,
+                "today_usage_cm": round(spec.get("today_usage", 0), 1),
                 "daily_avg_cm": round(spec.get("daily_average_usage", 0), 1),
                 "auto_advance": spec.get("auto_advance"),
             }
@@ -270,6 +273,7 @@ class ReefBeatClient:
 
         return {
             "timestamp": time.time(),
+            "tank_name": tank_name,
             "temperature_c": round(temp_c, 1) if temp_c else None,
             "temperature_f": temp_f,
             "water_level": ato_sensor.get("current_level"),

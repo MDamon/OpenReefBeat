@@ -223,21 +223,30 @@ def render_dashboard(data, temp_history=None, location=""):
         else:
             updated_ago = f"{mins_ago // 60}h ago"
 
-    # ── Header ──────────────────────────────────────────
-    draw.rectangle([0, 0, WIDTH, HEADER_H], fill=BLUE)
-    title = f"OpenReefBeat"
-    if location:
-        title += f"  \u00b7  {location}"
-    draw.text((PAD, 6), title, fill=WHITE, font=FONT_HEADER)
+    # ── Header (matches Inky Frame: tank name | status | date/time) ──
+    leak = data.get("leak_status", "dry")
+    level = data.get("water_level", "desired")
+    if leak != "dry":
+        status_text, header_color = "LEAK DETECTED", RED
+    elif level != "desired":
+        status_text, header_color = f"Level: {level}", RED
+    else:
+        status_text, header_color = "All systems operational", BLUE
 
-    # Date/time + last updated on the right
-    right_top = f"{date_str}  {time_str}"
-    right_bot = f"Updated {updated_ago}" if updated_ago else ""
-    rtw = _tw(draw, right_top, FONT_HEADER_SM)
-    draw.text((WIDTH - PAD - rtw, 6), right_top, fill=WHITE, font=FONT_HEADER_SM)
-    if right_bot:
-        rbw = _tw(draw, right_bot, FONT_SMALL)
-        draw.text((WIDTH - PAD - rbw, 24), right_bot, fill=WHITE, font=FONT_SMALL)
+    draw.rectangle([0, 0, WIDTH, HEADER_H], fill=header_color)
+    tank = data.get("tank_name", "")
+    if not tank and location:
+        tank = location
+    draw.text((PAD, 12), tank, fill=WHITE, font=FONT_HEADER)
+
+    # Status centered
+    stw = _tw(draw, status_text, FONT_HEADER)
+    draw.text((WIDTH // 2 - stw / 2, 12), status_text, fill=WHITE, font=FONT_HEADER)
+
+    # Date/time right
+    right_text = f"{date_str} {time_str}"
+    rtw = _tw(draw, right_text, FONT_HEADER)
+    draw.text((WIDTH - PAD - rtw, 12), right_text, fill=WHITE, font=FONT_HEADER)
 
     # ── Left/Right divider ────────────────────────────
     draw.line([LEFT_W, HEADER_H, LEFT_W, HEIGHT - BTN_H], fill=BLACK, width=1)
