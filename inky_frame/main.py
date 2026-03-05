@@ -5,6 +5,7 @@ import math
 import time
 import urequests
 import ntptime
+import machine
 import inky_helper as ih
 from picographics import PicoGraphics, DISPLAY_INKY_FRAME_7 as DISPLAY
 from config import *
@@ -30,26 +31,64 @@ PAD = 16
 
 # Button toggle states (True = active/on)
 btn_states = {
-    "A": False,  # ATO Off/On
-    "B": False,  # Waste Off/On
-    "C": False,  # Salt Fill Off/On
+    "A": False,  # Water change sequence
+    "B": False,  # ATO auto-fill
+    "C": False,  # Return pump on/off
     "D": False,  # Resume/Stop Skimmer
-    "E": False,  # Stop All / Resume All
+    "E": False,  # Emergency Stop/Resume
 }
+
+# Kasa cloud config (imported from config.py: KASA_TOKEN, KASA_CLOUD_URL,
+# KASA_WASTE_DEVICE, KASA_WASTE_CHILD, KASA_SALT_DEVICE, KASA_SALT_CHILD)
+btn_a_label = "10m W/C"
 GAUGE_R = 50
 GAUGE_THICK = 15
 GAUGE_STEPS = 72  # points per full circle — balances smoothness vs memory
+UTC_OFFSET = -5  # EST (Eastern Standard Time)
 
 gc.collect()
+
+
+# ── WiFi helper ────────────────────────────────────────────
+def ensure_wifi():
+    """Check WiFi and reconnect if needed."""
+    import network
+    wlan = network.WLAN(network.STA_IF)
+    if wlan.isconnected():
+        return True
+    print("WiFi dropped — reconnecting...")
+    for attempt in range(3):
+        wlan.active(False)
+        time.sleep(2)
+        wlan.active(True)
+        time.sleep(1)
+        wlan.config(pm=0xa11140)
+        for ssid, pwd in WIFI_NETWORKS:
+            print("  Trying '{}'...".format(ssid))
+            wlan.disconnect()
+            time.sleep(1)
+            wlan.connect(ssid, pwd)
+            for _ in range(30):
+                if wlan.isconnected():
+                    print("  Reconnected to '{}'".format(ssid))
+                    return True
+                time.sleep(1)
+        print("  Reconnect round {} failed".format(attempt + 1))
+    print("WiFi reconnect failed!")
+    return False
 
 
 # ── ReefBeat API ────────────────────────────────────────────
 BASE_URL = "https://cloud.thereefbeat.com"
 _token = None
+_aquarium_uid = None
+_pump_hwid = None
+_ato_hwid = None
 
 
 def api_login():
     global _token
+    ensure_wifi()
     headers = {
         "Content-Type": "application/x-www-form-urlencoded",
         "Authorization": "Basic " + CLIENT_CREDENTIALS,
@@ -65,6 +104,7 @@ def api_login():
             return
         except OSError as e:
             print("Login retry {}: {}".format(attempt + 1, e))
+            ensure_wifi()
             gc.collect()
             time.sleep(2)
     raise OSError("Login failed after 3 retries")
@@ -81,12 +121,71 @@ def api_get(path):
             return data
         except OSError as e:
             print("API retry {}: {}".format(attempt + 1, e))
+            ensure_wifi()
             gc.collect()
             time.sleep(2)
     raise OSError("API failed after 3 retries")
 
 
+def api_post(path):
+    """POST with empty body to ReefBeat API."""
+    ensure_wifi()
+    headers = {"Authorization": "Bearer " + _token, "Content-Type": "application/json"}
+    r = urequests.post(BASE_URL + path, headers=headers)
+    data = r.json()
+    r.close()
+    gc.collect()
+    print("POST {} -> {}".format(path, data))
+    return data
+
+
+def kasa_toggle(device_id, child_id, turn_on):
+    """Toggle a Kasa outlet via TP-Link cloud API using raw sockets."""
+    import ujson, usocket, ssl
+    state = 1 if turn_on else 0
+    inner = ujson.dumps({"context": {"child_ids": [child_id]}, "system": {"set_relay_state": {"state": state}}})
+    body = ujson.dumps({"method": "passthrough", "params": {"deviceId": device_id, "requestData": inner}})
+    path = "/?token=" + KASA_TOKEN
+    host = "use1-wap.tplinkcloud.com"
+
+    for attempt in range(3):
+        gc.collect()
+        ensure_wifi()
+        try:
+            ai = usocket.getaddrinfo(host, 443)
+            addr = ai[0][-1]
+            print("Kasa attempt {} -> {}".format(attempt + 1, addr))
+            s = usocket.socket()
+            s.connect(addr)
+            ss = ssl.wrap_socket(s, server_hostname=host)
+
+            request = "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}".format(
+                path, host, len(body), body)
+            ss.write(request.encode())
+
+            resp = b""
+            while True:
+                chunk = ss.read(512)
+                if not chunk:
+                    break
+                resp += chunk
+            ss.close()
+            gc.collect()
+
+            resp_str = resp.decode()
+            body_start = resp_str.find("\r\n\r\n")
+            resp_body = resp_str[body_start + 4:] if body_start >= 0 else ""
+            data = ujson.loads(resp_body) if resp_body.strip() else {}
+            print("Kasa {} child {} -> state={} err={}".format(device_id[-4:], child_id[-2:], state, data.get("error_code")))
+            return data
+        except Exception as e:
+            print("Kasa attempt {} failed: {}".format(attempt + 1, e))
+            time.sleep(3)
+    raise OSError("Kasa failed after 3 attempts")
+
+
 def fetch_tank_data():
+    global _aquarium_uid, _pump_hwid, _ato_hwid
     api_login()
     gc.collect()
 
@@ -94,6 +193,7 @@ def fetch_tank_data():
     if not aquariums:
         raise RuntimeError("No aquariums found")
     uid = aquariums[0]["uid"]
+    _aquarium_uid = uid
     tank_name = aquariums[0].get("name", "My Tank")
     del aquariums
     gc.collect()
@@ -107,9 +207,11 @@ def fetch_tank_data():
     atos = dashboard.get("reef_ato", [])
     if atos:
         ato_hwid = atos[0]["common"]["hwid"]
+        _ato_hwid = ato_hwid
     runs = dashboard.get("reef_run", [])
     if runs:
         pump_hwid = runs[0]["common"]["hwid"]
+        _pump_hwid = pump_hwid
 
     # Extract dashboard fields
     lights = dashboard.get("reef_lights", [])
@@ -173,10 +275,22 @@ def fetch_tank_data():
         p1 = pumps.get("pump_1", {})
         p2 = pumps.get("pump_2", {})
         result["return_pct"] = p1.get("intensity", 0)
+        result["return_schedule"] = p1.get("schedule_enabled", True)
         result["skimmer_pct"] = p2.get("intensity", 0)
         result["skimmer_sensor"] = p2.get("sensor_controlled", False)
         result["skimmer_state"] = p2.get("state", "operational")
+        result["skimmer_schedule"] = p2.get("schedule_enabled", True)
         del pumps, p1, p2
+    gc.collect()
+
+    # Shortcut states (maintenance, emergency)
+    try:
+        shortcuts = api_get("/aquarium/{}/shortcut".format(uid))
+        result["maint_active"] = shortcuts.get("maintenance_1", {}).get("active", False)
+        result["emergency_active"] = shortcuts.get("emergency_1", {}).get("active", False)
+    except Exception:
+        result["maint_active"] = False
+        result["emergency_active"] = False
     gc.collect()
 
     return result
@@ -270,7 +384,7 @@ def render_dashboard(data):
     HSCALE = 3
     tank = data.get("tank_name", "")
     graphics.text(tank, PAD, 10, WIDTH, scale=HSCALE)
-    t = time.localtime()
+    t = time.localtime(time.time() + UTC_OFFSET * 3600)
     ts = "{:02d}/{:02d} {:02d}:{:02d}".format(t[1], t[2], t[3], t[4])
     tw = graphics.measure_text(ts, scale=HSCALE)
     graphics.text(ts, WIDTH - PAD - tw, 10, WIDTH, scale=HSCALE)
@@ -457,32 +571,36 @@ def render_dashboard(data):
     graphics.line(0, btn_top, WIDTH, btn_top)
     btn_w = WIDTH // 5
     graphics.set_font("bitmap8")
-    # Button labels: (key, line1_off, line2_off, line1_on, line2_on, on_is_red)
-    btn_defs = [
-        ("A", "ATO", "Off", "ATO", "On", False),
-        ("B", "Waste", "Off", "Waste", "On", False),
-        ("C", "Salt Fill", "Off", "Salt Fill", "On", False),
-        ("D", "Resume", "Skimmer", "Stop", "Skimmer", True),
-        ("E", "Stop", "All", "Resume", "All", False),
+    # Button labels: (key, label) — dot color shows state (green=on, red=off)
+    btn_labels = [
+        ("A", btn_a_label),
+        ("B", "ATO"),
+        ("C", "Return"),
+        ("D", "Skimmer"),
+        ("E", "E-Stop"),
     ]
-    for i, (key, l1_off, l2_off, l1_on, l2_on, is_red) in enumerate(btn_defs):
+    for i, (key, label) in enumerate(btn_labels):
         bx = i * btn_w
         if i > 0:
             graphics.set_pen(BLACK)
             graphics.line(bx, btn_top, bx, HEIGHT)
         cx = bx + btn_w // 2
         on = btn_states[key]
-        t1 = l1_on if on else l1_off
-        t2 = l2_on if on else l2_off
-        # D button is red when showing "Resume" (off state = needs resume)
-        if is_red and not on:
-            graphics.set_pen(RED)
-        else:
-            graphics.set_pen(BLACK)
-        w1 = graphics.measure_text(t1, scale=2)
-        w2 = graphics.measure_text(t2, scale=2)
-        graphics.text(t1, cx - w1 // 2, btn_top + 6, WIDTH, scale=2)
-        graphics.text(t2, cx - w2 // 2, btn_top + 24, WIDTH, scale=2)
+        # Measure label to position dot + text as a unit
+        lw = graphics.measure_text(label, scale=2)
+        dot_r = 5
+        gap = 6
+        total_w = dot_r * 2 + gap + lw
+        start_x = cx - total_w // 2
+        # Status dot (green = active/on, red = off/inactive)
+        dot_color = GREEN if on else RED
+        graphics.set_pen(dot_color)
+        dot_y = btn_top + BTN_H // 2
+        graphics.circle(start_x + dot_r, dot_y, dot_r)
+        # Label text
+        graphics.set_pen(BLACK)
+        text_x = start_x + dot_r * 2 + gap
+        graphics.text(label, text_x, btn_top + (BTN_H - 16) // 2, WIDTH, scale=2)
 
     gc.collect()
 
@@ -505,6 +623,73 @@ def render_error(title, detail=""):
     msg = "Check WiFi and config.py"
     mw = graphics.measure_text(msg, scale=2)
     graphics.text(msg, cx - mw // 2, 300, scale=2)
+
+
+# ── Water change sequence ──────────────────────────────────
+def run_water_change(data):
+    """20-min water change: maintenance on, drain 10m, fill 10m, maintenance off."""
+    global btn_a_label
+    PHASE_MIN = 10
+
+    btn_states["A"] = True
+    try:
+        # Start maintenance mode (disables return, ATO, skimmer)
+        print("WC: Starting maintenance mode")
+        api_post("/aquarium/{}/shortcut/maintenance_1/start".format(_aquarium_uid))
+        time.sleep(3)
+        gc.collect()
+
+        # Drain phase — waste pump on for 10 min
+        print("WC: Drain phase — waste pump ON")
+        try:
+            kasa_toggle(KASA_WASTE_DEVICE, KASA_WASTE_CHILD, True)
+        except Exception as e:
+            print("WC: Kasa waste ON failed: {}".format(e))
+        for remaining in range(PHASE_MIN, 0, -1):
+            btn_a_label = "Waste {}m".format(remaining)
+            render_dashboard(data)
+            gc.collect()
+            graphics.update()
+            time.sleep(60)
+
+        print("WC: Drain done — waste pump OFF")
+        try:
+            kasa_toggle(KASA_WASTE_DEVICE, KASA_WASTE_CHILD, False)
+        except Exception as e:
+            print("WC: Kasa waste OFF failed: {}".format(e))
+
+        # Fill phase — salt pump on for 10 min
+        print("WC: Fill phase — salt pump ON")
+        try:
+            kasa_toggle(KASA_SALT_DEVICE, KASA_SALT_CHILD, True)
+        except Exception as e:
+            print("WC: Kasa salt ON failed: {}".format(e))
+        for remaining in range(PHASE_MIN, 0, -1):
+            btn_a_label = "Salt {}m".format(remaining)
+            render_dashboard(data)
+            gc.collect()
+            graphics.update()
+            time.sleep(60)
+
+        print("WC: Fill done — salt pump OFF")
+        try:
+            kasa_toggle(KASA_SALT_DEVICE, KASA_SALT_CHILD, False)
+        except Exception as e:
+            print("WC: Kasa salt OFF failed: {}".format(e))
+
+    finally:
+        # Always stop maintenance mode, even if Kasa calls failed
+        print("WC: Stopping maintenance mode")
+        try:
+            api_post("/aquarium/{}/shortcut/maintenance_1/stop".format(_aquarium_uid))
+        except Exception as e:
+            print("WC: Failed to stop maintenance: {}".format(e))
+        btn_states["A"] = False
+        btn_a_label = "10m W/C"
+        render_dashboard(data)
+        gc.collect()
+        graphics.update()
+        print("WC: Sequence complete")
 
 
 # ── Main ────────────────────────────────────────────────────
@@ -579,6 +764,14 @@ else:
         data = None
 
     if data:
+        # Set initial button states from actual device/API data
+        btn_states["A"] = False  # Water change not running
+        btn_states["B"] = data.get("auto_fill", False)
+        btn_states["C"] = data.get("return_schedule", True)
+        btn_states["D"] = data.get("skimmer_schedule", True)  # True = on
+        btn_states["E"] = data.get("emergency_active", False)
+        print("Initial btn_states: {}".format(btn_states))
+
         print("Rendering...")
         gc.collect()
         render_dashboard(data)
@@ -602,17 +795,67 @@ else:
             pressed = False
             for key, btn in buttons:
                 if btn.read():
+                    if key == "A":
+                        print("Button A pressed — starting water change")
+                        try:
+                            run_water_change(data)
+                        except Exception as e:
+                            print("Water change error: {}".format(e))
+                        pressed = True
+                        continue
                     btn_states[key] = not btn_states[key]
-                    print("Button {} pressed -> {}".format(key, btn_states[key]))
+                    on = btn_states[key]
+                    print("Button {} pressed -> {}".format(key, on))
+                    try:
+                        if key == "B":
+                            import ujson as _uj
+                            _body = _uj.dumps({"auto_fill": on})
+                            _hdrs = {"Authorization": "Bearer " + _token, "Content-Type": "application/json"}
+                            _r = urequests.put(BASE_URL + "/reef-ato/{}/configuration".format(_ato_hwid), data=_body, headers=_hdrs)
+                            print("ATO auto_fill={} -> {}".format(on, _r.json()))
+                            _r.close()
+                        elif key == "C":
+                            import ujson
+                            headers = {"Authorization": "Bearer " + _token, "Content-Type": "application/json"}
+                            if on:
+                                body = ujson.dumps({"pump_1": {"schedule_enabled": True}})
+                                r = urequests.put(BASE_URL + "/v2/reef-run/{}/pump/settings".format(_pump_hwid), data=body, headers=headers)
+                                print("Return pump on -> {}".format(r.json()))
+                                r.close()
+                            else:
+                                body = ujson.dumps({"pump_1": {"schedule_enabled": False}})
+                                r = urequests.put(BASE_URL + "/v2/reef-run/{}/pump/settings".format(_pump_hwid), data=body, headers=headers)
+                                print("Return pump off -> {}".format(r.json()))
+                                r.close()
+                        elif key == "D":
+                            import ujson
+                            headers = {"Authorization": "Bearer " + _token, "Content-Type": "application/json"}
+                            if on:
+                                # Resume/enable skimmer
+                                api_post("/reef-run/{}/pump/2/reset-state".format(_pump_hwid))
+                                body = ujson.dumps({"pump_2": {"schedule_enabled": True}})
+                                r = urequests.put(BASE_URL + "/v2/reef-run/{}/pump/settings".format(_pump_hwid), data=body, headers=headers)
+                                print("Skimmer on -> {}".format(r.json()))
+                                r.close()
+                            else:
+                                # Turn skimmer off
+                                body = ujson.dumps({"pump_2": {"schedule_enabled": False}})
+                                r = urequests.put(BASE_URL + "/v2/reef-run/{}/pump/settings".format(_pump_hwid), data=body, headers=headers)
+                                print("Skimmer off -> {}".format(r.json()))
+                                r.close()
+                        elif key == "E":
+                            action = "start" if on else "stop"
+                            api_post("/aquarium/{}/shortcut/emergency_1/{}".format(_aquarium_uid, action))
+                    except Exception as e:
+                        print("Button {} API error: {}".format(key, e))
                     pressed = True
             if pressed:
-                # Re-render with updated button states
                 gc.collect()
                 render_dashboard(data)
                 gc.collect()
                 graphics.update()
                 print("Display updated after button press")
-                time.sleep(1)  # debounce
+                time.sleep(1)
             else:
                 time.sleep(0.2)
 

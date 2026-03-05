@@ -14,5 +14,13 @@ REEFBEAT_PASSWORD = "your_password"
 # App credentials (see docs/REVERSE_ENGINEERING.md to capture this)
 CLIENT_CREDENTIALS = "see-docs/REVERSE_ENGINEERING.md-to-capture-this"
 
+# Kasa cloud (TP-Link HS300 power strip)
+KASA_TOKEN = "your-kasa-cloud-token"
+KASA_CLOUD_URL = "https://use1-wap.tplinkcloud.com"
+KASA_WASTE_DEVICE = "your-device-id"
+KASA_WASTE_CHILD = "your-waste-child-id"
+KASA_SALT_DEVICE = "your-device-id"
+KASA_SALT_CHILD = "your-salt-child-id"
+
 # Display settings
 REFRESH_MINUTES = 5
