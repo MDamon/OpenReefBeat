@@ -51,13 +51,16 @@ gc.collect()
 
 # ── WiFi helper ────────────────────────────────────────────
 def ensure_wifi():
-    """Check WiFi and reconnect if needed."""
+    """Check WiFi and reconnect if needed. Retries indefinitely with backoff."""
     import network
     wlan = network.WLAN(network.STA_IF)
     if wlan.isconnected():
         return True
     print("WiFi dropped — reconnecting...")
-    for attempt in range(3):
+    attempt = 0
+    while True:
+        attempt += 1
+        backoff = min(attempt * 5, 60)  # 5s, 10s, 15s, ... cap at 60s
         wlan.active(False)
         time.sleep(2)
         wlan.active(True)
@@ -70,12 +73,12 @@ def ensure_wifi():
             wlan.connect(ssid, pwd)
             for _ in range(30):
                 if wlan.isconnected():
-                    print("  Reconnected to '{}'".format(ssid))
+                    print("  Reconnected to '{}' (attempt {})".format(ssid, attempt))
                     return True
                 time.sleep(1)
-        print("  Reconnect round {} failed".format(attempt + 1))
-    print("WiFi reconnect failed!")
-    return False
+        print("  Reconnect round {} failed, waiting {}s...".format(attempt, backoff))
+        gc.collect()
+        time.sleep(backoff)
 
 
 # ── ReefBeat API ────────────────────────────────────────────
@@ -249,6 +252,7 @@ def fetch_tank_data():
         "roller_pct": roller_pct,
         "roller_days": mat.get("days_till_end_of_roll"),
         "roller_level": mat.get("roll_level", ""),
+        "roller_mode": mat.get("mode", ""),
         "roller_today_cm": round(mat.get("today_usage", 0), 1),
         "roller_avg_cm": round(mat.get("daily_average_usage", 0), 1),
         "roller_used_cm": round(mat.get("total_usage", 0), 1),
@@ -369,8 +373,11 @@ def render_dashboard(data):
     if leak != "dry":
         status_text = "[!!] LEAK DETECTED"
         header_color = RED
-    elif level != "desired":
+    elif level not in ("desired", "acceptable"):
         status_text = "[!!] Level: {}".format(level)
+        header_color = RED
+    elif data.get("roller_mode") == "torn_mat":
+        status_text = "[!!] MAT JAMMED"
         header_color = RED
     else:
         status_text = "All systems operational"
@@ -415,7 +422,7 @@ def render_dashboard(data):
     # Water level with status indicator
     y += 64
     level = data.get("level", "?")
-    level_ok = level == "desired"
+    level_ok = level in ("desired", "acceptable")
     graphics.set_pen(GREEN if level_ok else RED)
     graphics.circle(lx + 6, y + 10, 6)
     graphics.set_pen(BLACK if level_ok else RED)
@@ -477,7 +484,8 @@ def render_dashboard(data):
     roller_pct = data.get("roller_pct", 0)
     roller_days = data.get("roller_days")
     roller_level = data.get("roller_level", "")
-    bar_color = RED if roller_level == "running_low" else BLUE
+    roller_mode = data.get("roller_mode", "")
+    bar_color = RED if roller_level == "running_low" or roller_mode == "torn_mat" else BLUE
     if roller_pct > 0.1:
         bar_w = LEFT_W - PAD * 2
         graphics.set_pen(BLACK)
@@ -494,7 +502,11 @@ def render_dashboard(data):
         avg_in = round(data.get("roller_avg_cm", 0) / 2.54, 1)
         graphics.set_pen(BLACK)
         graphics.text("Today: {}in / Avg: {}in".format(today_in, avg_in), lx, y, WIDTH, scale=2)
-        if roller_days is not None:
+        if roller_mode == "torn_mat":
+            y += 18
+            graphics.set_pen(RED)
+            graphics.text("[!!] MAT JAMMED", lx, y, WIDTH, scale=2)
+        elif roller_days is not None:
             y += 18
             graphics.set_pen(RED if roller_days <= 5 else BLACK)
             graphics.text("{} days remaining".format(roller_days), lx, y, WIDTH, scale=2)
@@ -696,18 +708,19 @@ def run_water_change(data):
 print("OpenReefBeat starting...")
 gc.collect()
 
-# WiFi — retry full connection cycle up to 3 times
+# WiFi — retry indefinitely with backoff until connected
 import network
 wlan = network.WLAN(network.STA_IF)
-
-wlan.active(False)
-time.sleep(2)
-wlan.active(True)
-time.sleep(1)
-wlan.config(pm=0xa11140)
-
-for attempt in range(3):
-    print("WiFi round {}...".format(attempt + 1))
+attempt = 0
+while not wlan.isconnected():
+    attempt += 1
+    backoff = min(attempt * 5, 60)  # 5s, 10s, 15s, ... cap at 60s
+    wlan.active(False)
+    time.sleep(2)
+    wlan.active(True)
+    time.sleep(1)
+    wlan.config(pm=0xa11140)
+    print("WiFi round {}...".format(attempt))
     for ssid, pwd in WIFI_NETWORKS:
         print("  Trying '{}'...".format(ssid))
         wlan.disconnect()
@@ -722,145 +735,156 @@ for attempt in range(3):
             print("  Connected to '{}'".format(ssid))
             break
         print("  '{}' failed (status={})".format(ssid, status))
-    if wlan.isconnected():
-        break
-    print("Round {} failed, retrying...".format(attempt + 1))
-    wlan.active(False)
-    time.sleep(3)
-    wlan.active(True)
-    time.sleep(2)
-    wlan.config(pm=0xa11140)
+    if not wlan.isconnected():
+        print("Round {} failed, waiting {}s...".format(attempt, backoff))
+        gc.collect()
+        time.sleep(backoff)
 
-if not wlan.isconnected():
-    print("WiFi failed!")
-    render_error("WiFi Failed", "No networks found")
-    graphics.update()
-    ih.sleep(REFRESH_MINUTES)
-else:
-    print("WiFi connected")
+print("WiFi connected")
 
-    # Sync clock via NTP (retry up to 3 times)
-    for _ntp in range(3):
-        try:
-            ntptime.settime()
-            print("NTP time synced")
-            break
-        except Exception:
-            print("NTP attempt {} failed".format(_ntp + 1))
-            time.sleep(2)
-    else:
-        print("NTP sync failed (clock may be wrong)")
-    gc.collect()
-
+# Sync clock via NTP (retry up to 3 times)
+for _ntp in range(3):
     try:
-        print("Fetching tank data...")
-        data = fetch_tank_data()
-        print("Data fetched: temp={}F roller={}% days={}".format(data.get("temp_f"), data.get("roller_pct"), data.get("roller_days")))
-    except Exception as e:
-        print("API error: {}".format(e))
-        render_error("API Error", str(e))
-        graphics.update()
-        ih.sleep(REFRESH_MINUTES)
-        data = None
+        ntptime.settime()
+        print("NTP time synced")
+        break
+    except Exception:
+        print("NTP attempt {} failed".format(_ntp + 1))
+        time.sleep(2)
+else:
+    print("NTP sync failed (clock may be wrong)")
+gc.collect()
 
-    if data:
-        # Set initial button states from actual device/API data
-        btn_states["A"] = False  # Water change not running
-        btn_states["B"] = data.get("auto_fill", False)
-        btn_states["C"] = data.get("return_schedule", True)
-        btn_states["D"] = data.get("skimmer_schedule", True)  # True = on
-        btn_states["E"] = data.get("emergency_active", False)
-        print("Initial btn_states: {}".format(btn_states))
+try:
+    print("Fetching tank data...")
+    data = fetch_tank_data()
+    print("Data fetched: temp={}F roller={}% days={}".format(data.get("temp_f"), data.get("roller_pct"), data.get("roller_days")))
+except Exception as e:
+    print("API error: {} — rebooting in 30s...".format(e))
+    render_error("API Error", str(e))
+    graphics.update()
+    time.sleep(30)
+    machine.reset()
 
-        print("Rendering...")
+# Set initial button states from actual device/API data
+btn_states["A"] = False  # Water change not running
+btn_states["B"] = data.get("auto_fill", False)
+btn_states["C"] = data.get("return_schedule", True)
+btn_states["D"] = data.get("skimmer_schedule", True)  # True = on
+btn_states["E"] = data.get("emergency_active", False)
+print("Initial btn_states: {}".format(btn_states))
+
+print("Rendering...")
+gc.collect()
+render_dashboard(data)
+gc.collect()
+
+print("Updating display...")
+graphics.update()
+print("Done! Polling buttons for {} min...".format(REFRESH_MINUTES))
+
+# Poll buttons until refresh time
+import inky_frame
+buttons = [
+    ("A", inky_frame.button_a),
+    ("B", inky_frame.button_b),
+    ("C", inky_frame.button_c),
+    ("D", inky_frame.button_d),
+    ("E", inky_frame.button_e),
+]
+deadline = time.time() + REFRESH_MINUTES * 60
+while time.time() < deadline:
+    pressed = False
+    for key, btn in buttons:
+        if btn.read():
+            if key == "A":
+                _a_count = getattr(run_water_change, '_count', 0) + 1
+                _a_now = time.time()
+                _a_last = getattr(run_water_change, '_last', 0)
+                # Reset count if more than 5s since last press
+                if _a_now - _a_last > 5:
+                    _a_count = 1
+                run_water_change._count = _a_count
+                run_water_change._last = _a_now
+                if _a_count < 3:
+                    print("Button A press {}/3 — press {} more within 5s".format(_a_count, 3 - _a_count))
+                    btn_a_label = "W/C {}/3".format(_a_count)
+                    pressed = True
+                    continue
+                # 3 presses confirmed — reset and start
+                run_water_change._count = 0
+                btn_a_label = "10m W/C"
+                print("Button A confirmed — starting water change")
+                try:
+                    run_water_change(data)
+                except Exception as e:
+                    print("Water change error: {}".format(e))
+                pressed = True
+                continue
+            btn_states[key] = not btn_states[key]
+            on = btn_states[key]
+            print("Button {} pressed -> {}".format(key, on))
+            try:
+                if key == "B":
+                    import ujson as _uj
+                    _body = _uj.dumps({"auto_fill": on})
+                    _hdrs = {"Authorization": "Bearer " + _token, "Content-Type": "application/json"}
+                    _r = urequests.put(BASE_URL + "/reef-ato/{}/configuration".format(_ato_hwid), data=_body, headers=_hdrs)
+                    print("ATO auto_fill={} -> {}".format(on, _r.json()))
+                    _r.close()
+                elif key == "C":
+                    import ujson
+                    headers = {"Authorization": "Bearer " + _token, "Content-Type": "application/json"}
+                    if on:
+                        body = ujson.dumps({"pump_1": {"schedule_enabled": True}})
+                        r = urequests.put(BASE_URL + "/v2/reef-run/{}/pump/settings".format(_pump_hwid), data=body, headers=headers)
+                        print("Return pump on -> {}".format(r.json()))
+                        r.close()
+                    else:
+                        body = ujson.dumps({"pump_1": {"schedule_enabled": False}})
+                        r = urequests.put(BASE_URL + "/v2/reef-run/{}/pump/settings".format(_pump_hwid), data=body, headers=headers)
+                        print("Return pump off -> {}".format(r.json()))
+                        r.close()
+                elif key == "D":
+                    import ujson
+                    headers = {"Authorization": "Bearer " + _token, "Content-Type": "application/json"}
+                    if on:
+                        # Resume/enable skimmer
+                        api_post("/reef-run/{}/pump/2/reset-state".format(_pump_hwid))
+                        body = ujson.dumps({"pump_2": {"schedule_enabled": True}})
+                        r = urequests.put(BASE_URL + "/v2/reef-run/{}/pump/settings".format(_pump_hwid), data=body, headers=headers)
+                        print("Skimmer on -> {}".format(r.json()))
+                        r.close()
+                    else:
+                        # Turn skimmer off
+                        body = ujson.dumps({"pump_2": {"schedule_enabled": False}})
+                        r = urequests.put(BASE_URL + "/v2/reef-run/{}/pump/settings".format(_pump_hwid), data=body, headers=headers)
+                        print("Skimmer off -> {}".format(r.json()))
+                        r.close()
+                elif key == "E":
+                    action = "start" if on else "stop"
+                    api_post("/aquarium/{}/shortcut/emergency_1/{}".format(_aquarium_uid, action))
+            except Exception as e:
+                print("Button {} API error: {}".format(key, e))
+            pressed = True
+    # Reset W/C confirm label if it's been idle for 5s
+    _a_count = getattr(run_water_change, '_count', 0)
+    if _a_count > 0 and time.time() - getattr(run_water_change, '_last', 0) > 5:
+        run_water_change._count = 0
+        btn_a_label = "10m W/C"
+        pressed = True  # trigger re-render
+        print("W/C confirm timed out — reset")
+    if pressed:
         gc.collect()
         render_dashboard(data)
         gc.collect()
-
-        print("Updating display...")
         graphics.update()
-        print("Done! Polling buttons for {} min...".format(REFRESH_MINUTES))
+        print("Display updated after button press")
+        time.sleep(1)
+    else:
+        time.sleep(0.2)
 
-        # Poll buttons until refresh time
-        import inky_frame
-        buttons = [
-            ("A", inky_frame.button_a),
-            ("B", inky_frame.button_b),
-            ("C", inky_frame.button_c),
-            ("D", inky_frame.button_d),
-            ("E", inky_frame.button_e),
-        ]
-        deadline = time.time() + REFRESH_MINUTES * 60
-        while time.time() < deadline:
-            pressed = False
-            for key, btn in buttons:
-                if btn.read():
-                    if key == "A":
-                        print("Button A pressed — starting water change")
-                        try:
-                            run_water_change(data)
-                        except Exception as e:
-                            print("Water change error: {}".format(e))
-                        pressed = True
-                        continue
-                    btn_states[key] = not btn_states[key]
-                    on = btn_states[key]
-                    print("Button {} pressed -> {}".format(key, on))
-                    try:
-                        if key == "B":
-                            import ujson as _uj
-                            _body = _uj.dumps({"auto_fill": on})
-                            _hdrs = {"Authorization": "Bearer " + _token, "Content-Type": "application/json"}
-                            _r = urequests.put(BASE_URL + "/reef-ato/{}/configuration".format(_ato_hwid), data=_body, headers=_hdrs)
-                            print("ATO auto_fill={} -> {}".format(on, _r.json()))
-                            _r.close()
-                        elif key == "C":
-                            import ujson
-                            headers = {"Authorization": "Bearer " + _token, "Content-Type": "application/json"}
-                            if on:
-                                body = ujson.dumps({"pump_1": {"schedule_enabled": True}})
-                                r = urequests.put(BASE_URL + "/v2/reef-run/{}/pump/settings".format(_pump_hwid), data=body, headers=headers)
-                                print("Return pump on -> {}".format(r.json()))
-                                r.close()
-                            else:
-                                body = ujson.dumps({"pump_1": {"schedule_enabled": False}})
-                                r = urequests.put(BASE_URL + "/v2/reef-run/{}/pump/settings".format(_pump_hwid), data=body, headers=headers)
-                                print("Return pump off -> {}".format(r.json()))
-                                r.close()
-                        elif key == "D":
-                            import ujson
-                            headers = {"Authorization": "Bearer " + _token, "Content-Type": "application/json"}
-                            if on:
-                                # Resume/enable skimmer
-                                api_post("/reef-run/{}/pump/2/reset-state".format(_pump_hwid))
-                                body = ujson.dumps({"pump_2": {"schedule_enabled": True}})
-                                r = urequests.put(BASE_URL + "/v2/reef-run/{}/pump/settings".format(_pump_hwid), data=body, headers=headers)
-                                print("Skimmer on -> {}".format(r.json()))
-                                r.close()
-                            else:
-                                # Turn skimmer off
-                                body = ujson.dumps({"pump_2": {"schedule_enabled": False}})
-                                r = urequests.put(BASE_URL + "/v2/reef-run/{}/pump/settings".format(_pump_hwid), data=body, headers=headers)
-                                print("Skimmer off -> {}".format(r.json()))
-                                r.close()
-                        elif key == "E":
-                            action = "start" if on else "stop"
-                            api_post("/aquarium/{}/shortcut/emergency_1/{}".format(_aquarium_uid, action))
-                    except Exception as e:
-                        print("Button {} API error: {}".format(key, e))
-                    pressed = True
-            if pressed:
-                gc.collect()
-                render_dashboard(data)
-                gc.collect()
-                graphics.update()
-                print("Display updated after button press")
-                time.sleep(1)
-            else:
-                time.sleep(0.2)
-
-        del data
-        gc.collect()
-        # Reboot for fresh data cycle
-        import machine
-        machine.reset()
+del data
+gc.collect()
+# Reboot for fresh data cycle
+machine.reset()
