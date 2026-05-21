@@ -26,7 +26,7 @@ BLUE = 5
 GREEN = 6
 
 HEADER_H = 44
-LEFT_W = 280
+LEFT_W = 320
 PAD = 16
 
 # Button toggle states (True = active/on)
@@ -376,19 +376,14 @@ def _fill_ring(cx, cy, r_out, r_in, color, start_deg=0, end_deg=360):
 
 
 def draw_gauge(cx, cy, pct, color, label):
-    """Draw a circular gauge with percentage and label."""
-    r_out = GAUGE_R
-    r_in = GAUGE_R - GAUGE_THICK
+    """Render the percentage and label for a gauge.
 
-    # Black outer border ring
-    _fill_ring(cx, cy, r_out, r_in, BLACK)
-    # White track (1px inset)
-    _fill_ring(cx, cy, r_out - 1, r_in + 1, WHITE)
-
-    # Filled arc
-    if pct > 0:
-        end_deg = int(360 * min(pct, 100) / 100)
-        _fill_ring(cx, cy, r_out - 1, r_in + 1, color, 0, end_deg)
+    The ring background is intentionally not drawn — both pixel-iterated
+    rings (_fill_ring) and native graphics.circle() at this radius (50px)
+    reliably trigger Spectra-6 panel corruption ("repeating column"
+    artifact / blocky X shapes inside the ring). Text-only renders
+    cleanly. Revisit rings if a different visualization is needed.
+    """
 
     # Center text: value%
     graphics.set_pen(BLACK)
@@ -551,7 +546,7 @@ def render_dashboard(data):
     graphics.set_pen(GREEN if leak_ok else RED)
     graphics.circle(sx + 6, y + 30, 5)
     graphics.set_pen(BLACK if leak_ok else RED)
-    leak_label = "dry" if leak_ok else "WET!"
+    leak_label = "Cab Dry" if leak_ok else "Cab Wet"
     graphics.text(leak_label, sx + 16, y + 24, WIDTH, scale=2)
     gc.collect()
 
@@ -614,32 +609,32 @@ def render_dashboard(data):
         if fill_w > 0:
             graphics.set_pen(bar_color)
             graphics.rectangle(lx + 1, y + 1, fill_w, 18)
-        y += 26
+        y += 30
         # Today and average usage in inches
         today_in = round(data.get("roller_today_cm", 0) / 2.54, 1)
         avg_in = round(data.get("roller_avg_cm", 0) / 2.54, 1)
         graphics.set_pen(BLACK)
         graphics.text("Today: {}in / Avg: {}in".format(today_in, avg_in), lx, y, WIDTH, scale=2)
         if roller_mode == "torn_mat":
-            y += 18
+            y += 24
             graphics.set_pen(RED)
             graphics.text("[!!] MAT JAMMED", lx, y, WIDTH, scale=2)
         elif roller_days is not None:
-            y += 18
+            y += 24
             graphics.set_pen(RED if roller_days <= 5 else BLACK)
             graphics.text("{} days remaining".format(roller_days), lx, y, WIDTH, scale=2)
     else:
         graphics.text("No data", lx, y, WIDTH, scale=2)
 
     # Doser (2x2 grid)
-    y += 14
+    y += 20
     graphics.set_pen(BLACK)
     graphics.line(lx, y, LEFT_W - PAD, y)
-    y += 4
+    y += 8
     heads = data.get("doser_heads", [])
     if heads:
         cell_w = (LEFT_W - PAD * 2 - 4) // 2  # 4px gap between columns
-        cell_h = 58
+        cell_h = 56
         for i, head in enumerate(heads[:4]):
             col = i % 2
             row = i // 2
@@ -710,9 +705,10 @@ def render_dashboard(data):
     graphics.line(0, btn_top, WIDTH, btn_top)
     btn_w = WIDTH // 5
     graphics.set_font("bitmap8")
-    # Button labels: (key, label) — dot color shows state (green=on, red=off)
+    # Button labels: (key, label) — dot color shows state (green=on, red=off).
+    # A label of None leaves the slot empty (button A is disabled for now).
     btn_labels = [
-        ("A", btn_a_label),
+        ("A", None),
         ("B", "ATO"),
         ("C", "Return"),
         ("D", "Skimmer"),
@@ -723,6 +719,8 @@ def render_dashboard(data):
         if i > 0:
             graphics.set_pen(BLACK)
             graphics.line(bx, btn_top, bx, HEIGHT)
+        if label is None:
+            continue
         cx = bx + btn_w // 2
         on = btn_states[key]
         # Measure label to position dot + text as a unit
@@ -904,17 +902,30 @@ print("Initial btn_states: {}".format(btn_states))
 
 print("Rendering...")
 gc.collect()
+
+# Pre-clear: force the Spectra-6 panel to a known-clean white state before
+# pushing the dashboard. Without this, residual pixel state from prior renders
+# (especially interrupted ones) ghosts through as repeating-column artifacts.
+# Costs ~30s per boot but makes every render reliable.
+print("Pre-clearing panel...")
+graphics.set_pen(WHITE)
+graphics.clear()
+graphics.update()
+print("Pre-clear done")
+
 render_dashboard(data)
 gc.collect()
 
 print("Updating display...")
+time.sleep_ms(100)  # let SPI bus + framebuffer settle before kicking off the panel update
 graphics.update()
 print("Done! Polling buttons for {} min...".format(REFRESH_MINUTES))
 
 # Poll buttons until refresh time
 import inky_frame
+# Button A (water change) is disabled for now — slot is empty in the UI.
+# run_water_change() and kasa_toggle() are left in place for easy re-enable.
 buttons = [
-    ("A", inky_frame.button_a),
     ("B", inky_frame.button_b),
     ("C", inky_frame.button_c),
     ("D", inky_frame.button_d),
@@ -926,30 +937,6 @@ while time.time() < deadline:
     pressed = False
     for key, btn in buttons:
         if btn.read():
-            if key == "A":
-                _a_count = getattr(run_water_change, '_count', 0) + 1
-                _a_now = time.time()
-                _a_last = getattr(run_water_change, '_last', 0)
-                # Reset count if more than 5s since last press
-                if _a_now - _a_last > 5:
-                    _a_count = 1
-                run_water_change._count = _a_count
-                run_water_change._last = _a_now
-                if _a_count < 3:
-                    print("Button A press {}/3 — press {} more within 5s".format(_a_count, 3 - _a_count))
-                    btn_a_label = "W/C {}/3".format(_a_count)
-                    pressed = True
-                    continue
-                # 3 presses confirmed — reset and start
-                run_water_change._count = 0
-                btn_a_label = "10m W/C"
-                print("Button A confirmed — starting water change")
-                try:
-                    run_water_change(data)
-                except Exception as e:
-                    print("Water change error: {}".format(e))
-                pressed = True
-                continue
             btn_states[key] = not btn_states[key]
             on = btn_states[key]
             print("Button {} pressed -> {}".format(key, on))
@@ -996,13 +983,6 @@ while time.time() < deadline:
             except Exception as e:
                 print("Button {} API error: {}".format(key, e))
             pressed = True
-    # Reset W/C confirm label if it's been idle for 5s
-    _a_count = getattr(run_water_change, '_count', 0)
-    if _a_count > 0 and time.time() - getattr(run_water_change, '_last', 0) > 5:
-        run_water_change._count = 0
-        btn_a_label = "10m W/C"
-        pressed = True  # trigger re-render
-        print("W/C confirm timed out — reset")
     if pressed:
         gc.collect()
         render_dashboard(data)
