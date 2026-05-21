@@ -227,6 +227,7 @@ def fetch_tank_data():
     # Extract HWIDs
     ato_hwid = None
     pump_hwid = None
+    doser_hwid = None
     atos = dashboard.get("reef_ato", [])
     if atos:
         ato_hwid = atos[0]["common"]["hwid"]
@@ -235,6 +236,9 @@ def fetch_tank_data():
     if runs:
         pump_hwid = runs[0]["common"]["hwid"]
         _pump_hwid = pump_hwid
+    dosers = dashboard.get("reef_dosing", [])
+    if dosers:
+        doser_hwid = dosers[0]["common"]["hwid"]
 
     # Extract dashboard fields
     lights = dashboard.get("reef_lights", [])
@@ -305,6 +309,27 @@ def fetch_tank_data():
         result["skimmer_state"] = p2.get("state", "operational")
         result["skimmer_schedule"] = p2.get("schedule_enabled", True)
         del pumps, p1, p2
+    gc.collect()
+
+    # Doser (ReefDose) — 2x2 grid of heads on the dashboard
+    result["doser_heads"] = []
+    if doser_hwid:
+        try:
+            ds = api_get("/reef-dosing/{}/dashboard".format(doser_hwid))
+            heads = ds.get("heads", {})
+            for key in sorted(heads.keys()):
+                h = heads[key]
+                result["doser_heads"].append({
+                    "supplement": h.get("supplement", ""),
+                    "state": h.get("state", "off"),
+                    "daily_dose": h.get("daily_dose", 0),
+                    "dosed_today": h.get("auto_dosed_today", 0) + h.get("manual_dosed_today", 0),
+                    "stock_level": h.get("stock_level", ""),
+                    "remaining_days": h.get("remaining_days"),
+                })
+            del ds, heads
+        except Exception as e:
+            print("Doser fetch failed: {}".format(e))
     gc.collect()
 
     # Shortcut states (maintenance, emergency)
@@ -381,6 +406,77 @@ def draw_gauge(cx, cy, pct, color, label):
     gc.collect()
 
 
+def draw_dose_head(x, y, w, h, head):
+    """Draw a single ReefDose head cell with bottle icon + name + dose progress."""
+    supp = head.get("supplement", "")
+    state = head.get("state", "off")
+    daily = head.get("daily_dose", 0)
+    dosed = head.get("dosed_today", 0)
+    stock = head.get("stock_level", "")
+    days = head.get("remaining_days")
+
+    # Bottle icon on right side, vertically centered
+    BW, BH = 12, 28
+    bx = x + w - BW - 2
+    by = y + (h - BH) // 2
+
+    graphics.set_pen(BLACK)
+    # Cap
+    graphics.rectangle(bx + 3, by - 3, BW - 6, 3)
+    # Body outline
+    graphics.rectangle(bx, by, BW, BH)
+    graphics.set_pen(WHITE)
+    graphics.rectangle(bx + 1, by + 1, BW - 2, BH - 2)
+
+    # Fill colored by stock level
+    if stock == "high":
+        color, pct = GREEN, 100
+    elif stock == "medium":
+        color, pct = BLUE, 66
+    elif stock == "low":
+        color, pct = YELLOW, 33
+    elif stock == "no_auto_dose":
+        color, pct = BLUE, 100  # full but not auto-dosing — matches the app
+    else:
+        color, pct = RED, 15
+
+    fh = int((BH - 4) * pct / 100)
+    if fh > 0:
+        graphics.set_pen(color)
+        graphics.rectangle(bx + 2, by + BH - 2 - fh, BW - 4, fh)
+
+    # Text area to the left of the bottle
+    tx = x + 2
+    tw = w - BW - 8
+
+    # Line 1: supplement name (truncated to fit)
+    graphics.set_font("bitmap8")
+    name = supp[:8]
+    graphics.set_pen(RED if state == "off" else BLACK)
+    graphics.text(name, tx, y + 2, tw, scale=2)
+
+    # Line 2: dosed / daily
+    graphics.set_pen(BLACK)
+    if daily:
+        if daily == int(daily) and dosed == int(dosed):
+            dose_text = "{}/{}mL".format(int(dosed), int(daily))
+        else:
+            dose_text = "{}/{}mL".format(dosed, daily)
+        graphics.text(dose_text, tx, y + 20, tw, scale=2)
+
+    # Line 3: status detail (small)
+    if stock == "low":
+        graphics.set_pen(RED)
+        graphics.text("{}d left".format(days) if days is not None else "low", tx, y + 40, tw, scale=1)
+    elif stock == "no_auto_dose":
+        graphics.set_pen(BLUE)
+        graphics.text("manual", tx, y + 40, tw, scale=1)
+    elif days is not None and days < 30:
+        graphics.set_pen(BLACK)
+        graphics.text("{}d".format(days), tx, y + 40, tw, scale=1)
+    gc.collect()
+
+
 # ── Dashboard renderer ──────────────────────────────────────
 def render_dashboard(data):
     graphics.set_pen(WHITE)
@@ -426,9 +522,9 @@ def render_dashboard(data):
 
     # LEFT PANEL
     lx = PAD
-    y = HEADER_H + 16
+    y = HEADER_H + 14
 
-    # Temperature
+    # Temperature (left) + Level/Leak status (right, stacked)
     temp = data.get("temp_f")
     graphics.set_pen(BLACK)
     graphics.set_font("bitmap8")
@@ -437,48 +533,50 @@ def render_dashboard(data):
     else:
         graphics.set_pen(RED)
         graphics.text("--.-F", lx, y, WIDTH, scale=6)
-    gc.collect()
 
-    # Water level with status indicator
-    y += 64
+    # Status indicators to the right of the temperature.
+    # Short labels (left panel is narrow); dot color carries the OK/alert signal.
     level = data.get("level", "?")
     level_ok = level in ("desired", "acceptable")
+    leak = data.get("leak", "?")
+    leak_ok = leak == "dry"
+    sx = lx + 165  # x-position right of temp text
+    # Level row
     graphics.set_pen(GREEN if level_ok else RED)
-    graphics.circle(lx + 6, y + 10, 6)
+    graphics.circle(sx + 6, y + 8, 5)
     graphics.set_pen(BLACK if level_ok else RED)
-    graphics.set_font("bitmap8")
-    graphics.text("Level: {}".format(level), lx + 18, y + 2, WIDTH, scale=2)
+    lvl_label = "Lvl OK" if level_ok else level[:5]
+    graphics.text(lvl_label, sx + 16, y + 2, WIDTH, scale=2)
+    # Leak row (below)
+    graphics.set_pen(GREEN if leak_ok else RED)
+    graphics.circle(sx + 6, y + 30, 5)
+    graphics.set_pen(BLACK if leak_ok else RED)
+    leak_label = "dry" if leak_ok else "WET!"
+    graphics.text(leak_label, sx + 16, y + 24, WIDTH, scale=2)
+    gc.collect()
 
-    y += 30
+    y += 50
     graphics.set_pen(BLACK)
     graphics.line(lx, y, LEFT_W - PAD, y)
 
     # ATO
-    y += 10
+    y += 6
     graphics.set_pen(BLUE)
     graphics.set_font("bitmap8")
     graphics.text("ATO", lx, y, WIDTH, scale=3)
 
-    y += 28
+    y += 26
     graphics.set_pen(BLACK)
     vol_gal = round(data.get("ato_vol_ml", 0) / 3785.41, 2)
     graphics.text("{} gal today".format(vol_gal), lx, y, WIDTH, scale=2)
 
-    y += 22
+    y += 20
     fills = data.get("ato_fills", 0)
     auto = "ON" if data.get("auto_fill") else "OFF"
     graphics.text("{} fills / Auto {}".format(fills, auto), lx, y, WIDTH, scale=2)
-
-    y += 22
-    leak = data.get("leak", "?")
-    leak_ok = leak == "dry"
-    graphics.set_pen(GREEN if leak_ok else RED)
-    graphics.circle(lx + 6, y + 8, 6)
-    graphics.set_pen(BLACK if leak_ok else RED)
-    graphics.text("Leak: {}".format(leak), lx + 18, y, WIDTH, scale=2)
     gc.collect()
 
-    y += 30
+    y += 24
     graphics.set_pen(BLACK)
     graphics.line(lx, y, LEFT_W - PAD, y)
 
@@ -533,12 +631,21 @@ def render_dashboard(data):
     else:
         graphics.text("No data", lx, y, WIDTH, scale=2)
 
-    # Branding below roller
-    y += 24
+    # Doser (2x2 grid)
+    y += 14
     graphics.set_pen(BLACK)
     graphics.line(lx, y, LEFT_W - PAD, y)
-    y += 6
-    graphics.text("OpenReefBeat", lx, y, WIDTH, scale=1)
+    y += 4
+    heads = data.get("doser_heads", [])
+    if heads:
+        cell_w = (LEFT_W - PAD * 2 - 4) // 2  # 4px gap between columns
+        cell_h = 58
+        for i, head in enumerate(heads[:4]):
+            col = i % 2
+            row = i // 2
+            cx = lx + col * (cell_w + 4)
+            cy = y + row * cell_h
+            draw_dose_head(cx, cy, cell_w, cell_h, head)
     gc.collect()
 
     # RIGHT PANEL — gauge layout (3 columns x 2 rows)
