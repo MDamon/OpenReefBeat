@@ -41,8 +41,8 @@ btn_states = {
 # Kasa cloud config (imported from config.py: KASA_TOKEN, KASA_CLOUD_URL,
 # KASA_WASTE_DEVICE, KASA_WASTE_CHILD, KASA_SALT_DEVICE, KASA_SALT_CHILD)
 btn_a_label = "10m W/C"
-GAUGE_R = 50
-GAUGE_THICK = 15
+GAUGE_R = 45
+GAUGE_THICK = 12
 GAUGE_STEPS = 72  # points per full circle — balances smoothness vs memory
 UTC_OFFSET = -5  # EST (Eastern Standard Time)
 
@@ -346,58 +346,56 @@ def fetch_tank_data():
 
 
 # ── Drawing helpers ─────────────────────────────────────────
-def _fill_ring(cx, cy, r_out, r_in, color, start_deg=0, end_deg=360):
-    """Fill a ring sector pixel-by-pixel. Solid, no gaps."""
-    graphics.set_pen(color)
-    r_out_sq = r_out * r_out
-    r_in_sq = r_in * r_in
-    # Convert to radians (0=top, clockwise)
-    if start_deg == 0 and end_deg == 360:
-        # Full ring — skip angle check for speed
-        for dy in range(-r_out, r_out + 1):
-            for dx in range(-r_out, r_out + 1):
-                d_sq = dx * dx + dy * dy
-                if r_in_sq <= d_sq <= r_out_sq:
-                    graphics.pixel(cx + dx, cy + dy)
-    else:
-        s_rad = (start_deg - 90) * math.pi / 180
-        e_rad = (end_deg - 90) * math.pi / 180
-        for dy in range(-r_out, r_out + 1):
-            for dx in range(-r_out, r_out + 1):
-                d_sq = dx * dx + dy * dy
-                if r_in_sq <= d_sq <= r_out_sq:
-                    a = math.atan2(dy, dx)
-                    # Normalize to match our start reference
-                    if a < s_rad:
-                        a += 2 * math.pi
-                    if s_rad <= a <= e_rad:
-                        graphics.pixel(cx + dx, cy + dy)
-    gc.collect()
-
-
 def draw_gauge(cx, cy, pct, color, label):
-    """Render the percentage and label for a gauge.
+    """Circular gauge: outer + inner black outlines + colored % arc + center text.
 
-    The ring background is intentionally not drawn — both pixel-iterated
-    rings (_fill_ring) and native graphics.circle() at this radius (50px)
-    reliably trigger Spectra-6 panel corruption ("repeating column"
-    artifact / blocky X shapes inside the ring). Text-only renders
-    cleanly. Revisit rings if a different visualization is needed.
+    Arc fill is built from small filled rectangles (not lines or pixels) —
+    on this Spectra-6 panel, single-pixel lines don't render visibly and
+    bulk pixel writes corrupt the buffer. Filled rectangles render solidly.
+    Ring outlines via two concentric filled circles each.
     """
+    r_out = GAUGE_R
+    r_in = GAUGE_R - GAUGE_THICK
 
-    # Center text: value%
+    # Outer outline: 2px black ring at r_out
+    graphics.set_pen(BLACK)
+    graphics.circle(cx, cy, r_out)
+    graphics.set_pen(WHITE)
+    graphics.circle(cx, cy, r_out - 2)
+    # Inner outline: 2px black ring at r_in
+    graphics.set_pen(BLACK)
+    graphics.circle(cx, cy, r_in)
+    graphics.set_pen(WHITE)
+    graphics.circle(cx, cy, r_in - 2)
+
+    # Arc fill — dense small filled rectangles in the white track between rings.
+    # 4 radial stacks spanning the track end-to-end so the colored arc
+    # touches both ring outlines without gaps.
+    if pct > 0:
+        graphics.set_pen(color)
+        segments = 240  # finer angular stepping for smoother edges
+        n_segs = int(segments * min(pct, 100) / 100)
+        radii = (r_in + 2, r_in + 5, r_out - 5, r_out - 2)
+        for i in range(n_segs):
+            a = (i / segments) * 2 * math.pi - math.pi / 2  # 0=top, clockwise
+            cos_a = math.cos(a)
+            sin_a = math.sin(a)
+            for r in radii:
+                px = int(cx + r * cos_a)
+                py = int(cy + r * sin_a)
+                graphics.rectangle(px - 2, py - 2, 4, 4)
+
+    # Center text: percentage
     graphics.set_pen(BLACK)
     graphics.set_font("bitmap8")
     val = "{}%".format(int(pct))
     vw = graphics.measure_text(val, scale=3)
-    vx = max(0, cx - vw // 2)
-    graphics.text(val, vx, cy - 8, WIDTH, scale=3)
+    graphics.text(val, max(0, cx - vw // 2), cy - 8, WIDTH, scale=3)
 
     # Label below
     if label:
         lw = graphics.measure_text(label, scale=2)
-        lbx = max(0, cx - lw // 2)
-        graphics.text(label, lbx, cy + GAUGE_R + 10, WIDTH, scale=2)
+        graphics.text(label, max(0, cx - lw // 2), cy + r_out + 10, WIDTH, scale=2)
     gc.collect()
 
 
