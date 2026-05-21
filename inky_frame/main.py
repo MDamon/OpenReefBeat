@@ -49,6 +49,22 @@ UTC_OFFSET = -5  # EST (Eastern Standard Time)
 gc.collect()
 
 
+# ── Hang recovery (software watchdog) ──────────────────────
+# Without this, a stalled urequests call or hung WiFi reconnect freezes the
+# frame indefinitely (which is what was killing it after ~a day). Hardware
+# WDT can't be used: RP2350 max is 8.4s but Inky 7.3" full refresh takes
+# ~25-30s. A re-armable ONE_SHOT timer lets us bound longer ops while still
+# catching genuine hangs — feed at safe checkpoints, miss for 120s = reset.
+_WDOG_MS = 120000
+_wdog = machine.Timer()
+def _wdog_fire(t):
+    print("[WDOG] no progress for {}s - resetting".format(_WDOG_MS // 1000))
+    machine.reset()
+def wdog_feed():
+    _wdog.init(period=_WDOG_MS, mode=machine.Timer.ONE_SHOT, callback=_wdog_fire)
+wdog_feed()
+
+
 # ── WiFi helper ────────────────────────────────────────────
 def ensure_wifi():
     """Check WiFi and reconnect if needed. Retries indefinitely with backoff."""
@@ -59,6 +75,7 @@ def ensure_wifi():
     print("WiFi dropped — reconnecting...")
     attempt = 0
     while True:
+        wdog_feed()
         attempt += 1
         backoff = min(attempt * 5, 60)  # 5s, 10s, 15s, ... cap at 60s
         wlan.active(False)
@@ -98,6 +115,7 @@ def api_login():
     }
     body = "grant_type=password&username={}&password={}".format(USERNAME, REEFBEAT_PASSWORD)
     for attempt in range(3):
+        wdog_feed()
         try:
             r = urequests.post(BASE_URL + "/oauth/token", data=body, headers=headers)
             data = r.json()
@@ -116,6 +134,7 @@ def api_login():
 def api_get(path):
     headers = {"Authorization": "Bearer " + _token}
     for attempt in range(3):
+        wdog_feed()
         try:
             r = urequests.get(BASE_URL + path, headers=headers)
             data = r.json()
@@ -133,6 +152,7 @@ def api_get(path):
 def api_post(path):
     """POST with empty body to ReefBeat API."""
     ensure_wifi()
+    wdog_feed()
     headers = {"Authorization": "Bearer " + _token, "Content-Type": "application/json"}
     r = urequests.post(BASE_URL + path, headers=headers)
     data = r.json()
@@ -713,6 +733,7 @@ import network
 wlan = network.WLAN(network.STA_IF)
 attempt = 0
 while not wlan.isconnected():
+    wdog_feed()
     attempt += 1
     backoff = min(attempt * 5, 60)  # 5s, 10s, 15s, ... cap at 60s
     wlan.active(False)
@@ -794,6 +815,7 @@ buttons = [
 ]
 deadline = time.time() + REFRESH_MINUTES * 60
 while time.time() < deadline:
+    wdog_feed()
     pressed = False
     for key, btn in buttons:
         if btn.read():
